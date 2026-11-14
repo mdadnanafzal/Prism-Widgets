@@ -1,0 +1,15 @@
+{
+  "name": "System Bars",
+  "width": 300,
+  "height": 150,
+  "refresh": 2000,
+  "elements": [
+    { "type": "text", "x": 20, "y": 16, "text": "Performance", "size": 15, "weight": "semibold" },
+    { "type": "text", "x": 20, "y": 50, "w": 120, "text": "CPU", "size": 12.5, "color": "fg2" },
+    { "type": "text", "x": 180, "y": 50, "w": 100, "text": "{cpu}%", "size": 12.5, "align": "right" },
+    { "type": "bar",  "x": 20, "y": 70, "w": 260, "h": 6, "value": "{cpu}", "max": 100, "color": "accent" },
+    { "type": "text", "x": 20, "y": 92, "w": 120, "text": "Memory", "size": 12.5, "color": "fg2" },
+    { "type": "text", "x": 140, "y": 92, "w": 140, "text": "{ramused} / {ramtotal} GB", "size": 12.5, "align": "right" },
+    { "type": "bar",  "x": 20, "y": 112, "w": 260, "h": 6, "value": "{ram}", "max": 100, "color": "#FF8C42" }
+  ]
+}

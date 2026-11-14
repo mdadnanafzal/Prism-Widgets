@@ -1,0 +1,13 @@
+# Alternative build (Visual Studio / MinGW on Windows). The tested build is build.sh (MinGW-w64 cross-compile).
+cmake_minimum_required(VERSION 3.16)
+project(PrismWidgets CXX RC)
+set(CMAKE_CXX_STANDARD 17)
+add_executable(PrismWidgets WIN32 src/app.cpp src/settings.cpp src/widgets.cpp src/glass.cpp src/util.cpp src/json.cpp res/app.rc)
+target_compile_definitions(PrismWidgets PRIVATE UNICODE _UNICODE)
+target_link_libraries(PrismWidgets d2d1 dwrite windowscodecs ole32 uuid shell32 shlwapi shcore dwmapi wtsapi32 psapi advapi32 gdi32 user32)
+if(MSVC)
+  target_link_options(PrismWidgets PRIVATE /MANIFEST:NO /ENTRY:wWinMainCRTStartup)
+  set_property(TARGET PrismWidgets PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+else()
+  target_link_options(PrismWidgets PRIVATE -municode -static -s)
+endif()

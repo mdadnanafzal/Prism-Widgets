@@ -1,0 +1,14 @@
+{
+  // Custom widget example. Edit me! Changes appear instantly.
+  // Variables: {time:HH:mm} {date:dddd, d MMMM} {greeting} {user} {cpu} {ram}
+  //            {battery} {disk:C} {diskfree:C} {uptime} {countdown:2027-01-01} {todo}
+  "name": "Greeting",
+  "width": 340,
+  "height": 120,
+  "refresh": 60000,
+  "elements": [
+    { "type": "text", "x": 22, "y": 18, "text": "{greeting},", "size": 15, "color": "fg2" },
+    { "type": "text", "x": 22, "y": 38, "text": "{user}", "size": 32, "weight": "semibold" },
+    { "type": "text", "x": 22, "y": 84, "text": "You have {todo} tasks left today", "size": 13, "color": "fg3" }
+  ]
+}

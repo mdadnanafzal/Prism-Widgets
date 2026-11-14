@@ -1,0 +1,13 @@
+{
+  // Buttons launch apps, folders or links. "glyph" = Segoe Fluent Icons code point.
+  "name": "Launcher",
+  "width": 300,
+  "height": 96,
+  "refresh": 0,
+  "elements": [
+    { "type": "button", "x": 16,  "y": 18, "w": 60, "h": 60, "radius": 14, "glyph": "E774", "size": 20, "click": "https://www.google.com" },
+    { "type": "button", "x": 86,  "y": 18, "w": 60, "h": 60, "radius": 14, "glyph": "EC50", "size": 20, "click": "explorer.exe" },
+    { "type": "button", "x": 156, "y": 18, "w": 60, "h": 60, "radius": 14, "glyph": "E713", "size": 20, "click": "ms-settings:" },
+    { "type": "button", "x": 226, "y": 18, "w": 60, "h": 60, "radius": 14, "glyph": "E70B", "size": 20, "click": "notepad.exe" }
+  ]
+}

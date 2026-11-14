@@ -1,0 +1,11 @@
+{
+  "name": "Countdown",
+  "width": 220,
+  "height": 130,
+  "refresh": 60000,
+  "elements": [
+    { "type": "text", "x": 0, "y": 18, "w": 220, "text": "New Year 2027", "size": 13, "color": "fg2", "align": "center" },
+    { "type": "text", "x": 0, "y": 36, "w": 220, "text": "{countdown:2027-01-01}", "size": 48, "weight": "light", "align": "center" },
+    { "type": "text", "x": 0, "y": 98, "w": 220, "text": "days to go", "size": 12, "color": "accent", "weight": "semibold", "align": "center" }
+  ]
+}
