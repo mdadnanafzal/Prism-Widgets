@@ -37,7 +37,7 @@ bool UiDark() {
 }
 
 enum Page { P_WIDGETS, P_DETAIL, P_APPEARANCE, P_GENERAL, P_CUSTOM, P_PERF };
-struct Hot { D2D1_RECT_F r; int id; std::function<void()> act; };
+struct Hot { D2D1_RECT_F r; int id; std::function<void()> act; std::function<void(float, bool)> drag; };
 struct Preview { std::wstring key; std::vector<uint32_t> px; int w = 0, h = 0; float scale = 0; ID2D1Bitmap* bmp = nullptr; int gen = -1; };
 
 struct State {
@@ -52,6 +52,7 @@ struct State {
     std::vector<std::pair<std::wstring, float>> need;   // previews to render after this paint
     Pal p; D2D1_COLOR_F accent;
     Gfx* g = nullptr;
+    std::function<void(float, bool)> dragFn; D2D1_RECT_F dragRect{}; float dragT = 0;   // active slider drag
 } S;
 
 const float SIDE_W = 232;
@@ -60,7 +61,7 @@ const float SIDE_W = 232;
 class SampleWidget : public Widget {
 public:
     SampleWidget() { key = L"__sample"; title = L"Sample"; }
-    D2D1_SIZE_F BaseSize() override { return D2D1_SIZE_F{ 176, 104 }; }
+    D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ 176, 104 }; }
     void Draw(Gfx& g, float W, float) override {
         SYSTEMTIME st; GetLocalTime(&st);
         g.Text(FormatDateTime(st, LocaleUses24h() ? L"HH:mm" : L"h:mm"), R(16, 10, W, 60), 38, DWRITE_FONT_WEIGHT_LIGHT, g.ink.fg,
@@ -76,7 +77,13 @@ int NewId() { return S.nextId++; }
 void AddHot(D2D1_RECT_F r, int id, std::function<void()> act) {
     D2D1_RECT_F c{ std::max(r.left, S.clip.left), std::max(r.top, S.clip.top), std::min(r.right, S.clip.right), std::min(r.bottom, S.clip.bottom) };
     if (c.right <= c.left || c.bottom <= c.top) return;
-    S.hots.push_back({ c, id, std::move(act) });
+    S.hots.push_back({ c, id, std::move(act), nullptr });
+}
+void AddDrag(D2D1_RECT_F r, int id, std::function<void(float, bool)> drag) {
+    D2D1_RECT_F c{ std::max(r.left, S.clip.left), std::max(r.top, S.clip.top), std::min(r.right, S.clip.right), std::min(r.bottom, S.clip.bottom) };
+    if (c.right <= c.left || c.bottom <= c.top) return;
+    S.hots.push_back({ c, id, nullptr, std::move(drag) });
+    S.hots.back().r = r;   // keep the full track for value mapping
 }
 bool IsHover(int id) { return S.hover == id; }
 void T(const std::wstring& s, D2D1_RECT_F r, float size, DWRITE_FONT_WEIGHT w, D2D1_COLOR_F c, int align = 0, bool vcenter = true, bool wrap = false, const wchar_t* fam = FONT_TEXT) {
@@ -97,6 +104,19 @@ void Toggle(float right, float cy, bool on, std::function<void()> act) {
     S.g->FillCircle(kx, cy, on ? 8.5f : 7.5f, on ? OnAccent() : S.p.text2);
     AddHot(R(r.left - 4, r.top - 4, r.right + 4, r.bottom + 4), id, std::move(act));
 }
+
+// Slider: t in [0,1]; fn(t, done) is called while dragging and once on release
+void Slider(float x0, float x1, float cy, float t, std::function<void(float, bool)> fn) {
+    int id = NewId();
+    bool active = IsHover(id) || S.pressed == id;
+    S.g->FillRound(R(x0, cy - 2.5f, x1, cy + 2.5f), 2.5f, S.p.track);
+    float kx = x0 + (x1 - x0) * Clamp(t, 0.f, 1.f);
+    S.g->FillRound(R(x0, cy - 2.5f, kx, cy + 2.5f), 2.5f, S.accent);
+    S.g->FillCircle(kx, cy, active ? 10.f : 9.f, C(1, 1, 1));
+    S.g->StrokeCircle(kx, cy, active ? 10.f : 9.f, S.p.dark ? C(0, 0, 0, .35f) : C(0, 0, 0, .18f), 1);
+    AddDrag(R(x0 - 10, cy - 14, x1 + 10, cy + 14), id, std::move(fn));
+}
+float SliderT(const D2D1_RECT_F& r, float x) { return Clamp((x - (r.left + 10)) / std::max(1.f, (r.right - 10) - (r.left + 10)), 0.f, 1.f); }
 
 float SegmentedWidth(const std::vector<std::wstring>& ch) { float w = 0; for (auto& c : ch) w += std::max(56.f, TextW(c, 13, DWRITE_FONT_WEIGHT_SEMI_BOLD) + 26); return w + 4; }
 void Segmented(float right, float cy, const std::vector<std::wstring>& ch, int sel, std::function<void(int)> pick) {
@@ -304,7 +324,8 @@ void PageHeader(float x0, float x1, float& y, const std::wstring& title, const s
 
 // ------------------------------------------------------------------ pages
 float PageWidgets(float x0, float x1, float y) {
-    PageHeader(x0, x1, y, L"Widgets", L"Choose what shows on your desktop. Click a widget to customise it.");
+    Button(x1, y + 20, L"Arrange on desktop", true, [] { StartArrange(); }, 0xE7C2);
+    PageHeader(x0, x1 - 200, y, L"Widgets", L"Choose what shows on your desktop. Click a widget to customise it.");
     int cols = (x1 - x0) >= 680 ? 3 : 2;
     float gap = 16, cw = (x1 - x0 - gap * (cols - 1)) / cols, chh = 236;
     int n = 0;
@@ -367,10 +388,27 @@ float PageDetail(float x0, float x1, float y) {
 
     std::vector<RowSpec> disp;
     disp.push_back({ L"Show on desktop", L"", [w](D2D1_RECT_F r) { Toggle(r.right, (r.top + r.bottom) / 2, w->enabled, [w] { w->enabled = !w->enabled; Changed(w); }); } });
-    disp.push_back({ L"Size", L"", [w](D2D1_RECT_F r) {
-        int sel = 1; for (int i = 0; i < 4; i++) if (std::fabs(w->size - g_sizes[i]) < .01f) sel = i;
-        Segmented(r.right, (r.top + r.bottom) / 2, { L"S", L"M", L"L", L"XL" }, sel, [w](int i) { w->size = g_sizes[i]; Changed(w); });
+    disp.push_back({ L"Scale", L"Makes everything bigger or smaller (also: corner handles in Arrange mode)", [w](D2D1_RECT_F r) {
+        float cy = (r.top + r.bottom) / 2;
+        wchar_t b[16]; swprintf(b, 16, L"%d%%", (int)std::lround(w->size * 100));
+        T(b, R(r.right - 52, cy - 12, r.right, cy + 12), 13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, S.p.text, 2);
+        Slider(r.right - 290, r.right - 66, cy, (w->size - 0.6f) / 1.4f, [w](float t, bool done) {
+            w->size = Clamp(std::round((0.6f + t * 1.4f) * 20) / 20, 0.6f, 2.0f);
+            if (done) Changed(w); else PreviewWidget(w);
+        });
     } });
+    if (w->ResizableW() || w->ResizableH()) {
+        disp.push_back({ L"Content size", L"Drag the edge handles in Arrange mode — the layout adapts", [w](D2D1_RECT_F r) {
+            float cy = (r.top + r.bottom) / 2;
+            D2D1_SIZE_F b = w->BaseSize();
+            float bw = Button(r.right, cy, L"Reset", false, [w] { w->cw = w->ch = 0; Changed(w); });
+            bw += Button(r.right - bw - 10, cy, L"Resize", true, [] { StartArrange(); }) + 10;
+            wchar_t t[48]; swprintf(t, 48, L"%d × %d", (int)std::lround(b.width), (int)std::lround(b.height));
+            T(t, R(r.right - bw - 130, cy - 12, r.right - bw - 14, cy + 12), 13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, S.p.text2, 2);
+        } });
+    } else {
+        disp.push_back({ L"Content size", L"This widget has a fixed layout, so it can be scaled but not reshaped", nullptr });
+    }
     RowSpec th{ L"Theme", L"Override the global theme for this widget only", [w](D2D1_RECT_F r) {
         float x = r.left, yy = r.top;
         auto chip = [&](const std::wstring& label, const std::wstring& id) {
@@ -410,8 +448,9 @@ float PageDetail(float x0, float x1, float y) {
         y = Group(x0, x1, y, L"Options", rows);
     }
     std::vector<RowSpec> pos;
-    pos.push_back({ L"Position", L"Drag the widget on your desktop to move it", [w](D2D1_RECT_F r) {
-        Button(r.right, (r.top + r.bottom) / 2, L"Reset", false, [w] { w->placed = false; Changed(w); });
+    pos.push_back({ L"Position", L"Use Arrange mode to move, align and space widgets", [w](D2D1_RECT_F r) {
+        float bw = Button(r.right, (r.top + r.bottom) / 2, L"Reset", false, [w] { w->placed = false; w->hasAnchor = false; Changed(w); });
+        Button(r.right - bw - 10, (r.top + r.bottom) / 2, L"Arrange", true, [] { StartArrange(); });
     } });
     y = Group(x0, x1, y, L"", pos);
     return y;
@@ -479,10 +518,13 @@ float PageGeneral(float x0, float x1, float y) {
         Toggle(r.right, (r.top + r.bottom) / 2, IsStartup(), [] { SetStartup(!IsStartup()); });
     } } });
     std::vector<RowSpec> desk;
-    desk.push_back({ L"Lock widget positions", L"Prevents moving widgets by accident", [](D2D1_RECT_F r) {
-        Toggle(r.right, (r.top + r.bottom) / 2, g_locked, [] { g_locked = !g_locked; RequestSave(); }); } });
-    desk.push_back({ L"Snap while dragging", L"Align to screen edges and other widgets (hold Alt to bypass)", [](D2D1_RECT_F r) {
-        Toggle(r.right, (r.top + r.bottom) / 2, g_snap, [] { g_snap = !g_snap; RequestSave(); }); } });
+    desk.push_back({ L"Arrange widgets", L"Grid, alignment guides and equal spacing. Esc or Done to finish.", [](D2D1_RECT_F r) {
+        Button(r.right, (r.top + r.bottom) / 2, L"Arrange", true, [] { StartArrange(); }, 0xE7C2); } });
+    desk.push_back({ L"Move widgets without Arrange mode", L"Off: widgets stay put, so clicks never move them by accident", [](D2D1_RECT_F r) {
+        Toggle(r.right, (r.top + r.bottom) / 2, g_quickDrag, [] { g_quickDrag = !g_quickDrag; RequestSave(); }); } });
+    if (g_quickDrag)
+        desk.push_back({ L"Snap while dragging", L"Align to screen edges and other widgets (hold Alt to bypass)", [](D2D1_RECT_F r) {
+            Toggle(r.right, (r.top + r.bottom) / 2, g_snap, [] { g_snap = !g_snap; RequestSave(); }); } });
     desk.push_back({ L"Reset all widget positions", L"Stacks visible widgets on the right of your main screen", [](D2D1_RECT_F r) {
         Button(r.right, (r.top + r.bottom) / 2, L"Reset", false, [] { ResetPositions(); }); } });
     y = Group(x0, x1, y, L"Desktop", desk);
@@ -659,6 +701,14 @@ void Paint() {
     if (!S.need.empty()) { RenderQueued(); InvalidateRect(S.hwnd, nullptr, FALSE); }
 }
 
+void FinishDrag(HWND h) {
+    if (!S.dragFn) return;
+    auto fn = std::move(S.dragFn); S.dragFn = nullptr;
+    S.pressed = -1;
+    fn(S.dragT, true);
+    if (S.hwnd) InvalidateRect(h, nullptr, FALSE);
+}
+
 int HitTest(float x, float y) {
     for (int i = (int)S.hots.size() - 1; i >= 0; i--) if (Inside(S.hots[i].r, x, y)) return S.hots[i].id;
     return -1;
@@ -681,19 +731,30 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE: {
+        if (S.dragFn) {
+            if (!(wp & MK_LBUTTON)) { FinishDrag(h); return 0; }   // button released somewhere we didn't see
+            S.dragT = SliderT(S.dragRect, GET_X_LPARAM(lp) / S.s); S.dragFn(S.dragT, false); InvalidateRect(h, nullptr, FALSE); return 0;
+        }
         TRACKMOUSEEVENT t{ sizeof(t), TME_LEAVE, h, 0 }; TrackMouseEvent(&t);
         int id = HitTest(GET_X_LPARAM(lp) / S.s, GET_Y_LPARAM(lp) / S.s);
         if (id != S.hover) { S.hover = id; InvalidateRect(h, nullptr, FALSE); }
         return 0;
     }
+    case WM_CAPTURECHANGED: if (S.dragFn && (HWND)lp != h) FinishDrag(h); return 0;
     case WM_MOUSELEAVE: if (S.hover != -1) { S.hover = -1; InvalidateRect(h, nullptr, FALSE); } return 0;
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) { SetCursor(LoadCursorW(nullptr, S.hover >= 0 ? IDC_HAND : IDC_ARROW)); return TRUE; }
         break;
-    case WM_LBUTTONDOWN: S.pressed = HitTest(GET_X_LPARAM(lp) / S.s, GET_Y_LPARAM(lp) / S.s); SetCapture(h); return 0;
+    case WM_LBUTTONDOWN: {
+        float x = GET_X_LPARAM(lp) / S.s, y = GET_Y_LPARAM(lp) / S.s;
+        S.pressed = HitTest(x, y); SetCapture(h);
+        for (auto& hh : S.hots) if (hh.id == S.pressed && hh.drag) { S.dragFn = hh.drag; S.dragRect = hh.r; S.dragT = SliderT(S.dragRect, x); S.dragFn(S.dragT, false); InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
     case WM_LBUTTONUP: {
         ReleaseCapture();
         float x = GET_X_LPARAM(lp) / S.s, y = GET_Y_LPARAM(lp) / S.s;
+        if (S.dragFn) { S.dragT = SliderT(S.dragRect, x); FinishDrag(h); return 0; }
         int id = HitTest(x, y);
         if (id >= 0 && id == S.pressed) {
             std::function<void()> act;

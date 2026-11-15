@@ -1,11 +1,14 @@
 // Prism Widgets - app shell: widget windows, tray menu, config, scheduling.
 #include "app.h"
+#include "media.h"
 #include <psapi.h>
+#include <algorithm>
 #include <shellscalingapi.h>
 #include <wtsapi32.h>
 
 #define WM_TRAY        (WM_APP + 1)
 #define WM_SHOWSETTINGS (WM_APP + 2)
+#define WM_STARTARRANGE (WM_APP + 3)
 enum { T_TICK = 1, T_RELEASE, T_SAVE, T_WALLCHECK, T_RELOAD_CUSTOM, T_WALLRELOAD };
 
 HINSTANCE g_inst;
@@ -15,7 +18,7 @@ std::vector<std::unique_ptr<Widget>> g_widgets;
 static JVal g_cfg;
 std::wstring g_theme = L"liquid", g_accent = L"system", g_textMode = L"auto", g_uiTheme = L"system";
 static std::wstring g_wallSig;
-bool g_locked = false, g_snap = true, g_pauseFullscreen = true;
+bool g_quickDrag = false, g_snap = true, g_pauseFullscreen = true;
 static bool g_firstRun = false, g_sessionLocked = false, g_displayOff = false;
 static HANDLE g_dirWatch = INVALID_HANDLE_VALUE;
 
@@ -55,6 +58,7 @@ Ink MakeInk(const Theme& t, float lum) {
     return k;
 }
 static bool Paused() {
+    if (g_arranging) return false;   // our own full-screen overlay must not count as a "fullscreen app"
     if (g_sessionLocked || g_displayOff) return true;
     QUERY_USER_NOTIFICATION_STATE q;
     if (g_pauseFullscreen && SUCCEEDED(SHQueryUserNotificationState(&q)) && (q == QUNS_RUNNING_D3D_FULL_SCREEN || q == QUNS_PRESENTATION_MODE || q == QUNS_BUSY))
@@ -82,7 +86,7 @@ static void ArmRelease() { SetTimer(g_main, T_RELEASE, 8000, nullptr); }
 
 // ------------------------------------------------------------------ rendering
 // Draws widget content over its glass layer into the DIB selected into `mem`.
-static void DrawWidget(HDC mem, Widget* w, const Theme& t, const uint32_t* bg, int bw, int bh, int margin, float s, float lum) {
+static void DrawWidget(HDC mem, Widget* w, const Theme& t, const uint32_t* bg, int bw, int bh, int margin, float s, float lum, bool outline = false) {
     RECT rc{ 0, 0, bw, bh };
     if (FAILED(g_gr.rt->BindDC(mem, &rc))) return;
     float dpi = 96.f * s;
@@ -92,6 +96,11 @@ static void DrawWidget(HDC mem, Widget* w, const Theme& t, const uint32_t* bg, i
     g_gr.rt->SetTransform(&tr);
     D2D1_COLOR_F clear{ 0, 0, 0, 0 };
     g_gr.rt->Clear(&clear);
+    if (outline) {   // make the whole window (incl. shadow margin) clickable so edge handles work
+        D2D1_RECT_F all{ 0, 0, bw * 96.f / dpi, bh * 96.f / dpi };
+        g_gr.br->SetColor(D2D1_COLOR_F{ 0, 0, 0, 0.012f });
+        g_gr.rt->FillRectangle(&all, g_gr.br);
+    }
     // Blit the glass layer through D2D (DC targets don't reliably keep prior DIB contents)
     D2D1_BITMAP_PROPERTIES bp{ { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, dpi, dpi };
     ID2D1Bitmap* bgb = nullptr;
@@ -104,6 +113,36 @@ static void DrawWidget(HDC mem, Widget* w, const Theme& t, const uint32_t* bg, i
     Gfx g{ g_gr.rt, g_gr.br, MakeInk(t, lum) };
     D2D1_SIZE_F bs = w->BaseSize();
     w->Draw(g, bs.width, bs.height);
+    if (outline) {   // Arrange mode frame: accent for the selected widget, soft white for the rest
+        float r = std::min(t.radius + 1.5f, std::min(bs.width, bs.height) / 2);
+        D2D1_RECT_F fr{ -1.5f, -1.5f, bs.width + 1.5f, bs.height + 1.5f };
+        D2D1_COLOR_F acc = Accent(), white{ 1, 1, 1, 1 };
+        if (w == g_arrangeSel) {
+            g.StrokeRound(fr, r, acc, 3.f / w->size);
+            float hs = 1.f / w->size;   // handles keep a constant on-screen size
+            float W = bs.width, H = bs.height;
+            if (w->ResizableW()) for (float hx : { -1.5f, W + 1.5f }) {           // width handles
+                D2D1_RECT_F pr{ hx - 3.5f * hs, H / 2 - 15 * hs, hx + 3.5f * hs, H / 2 + 15 * hs };
+                g.FillRound(pr, 3.5f * hs, white); g.StrokeRound(pr, 3.5f * hs, acc, 1.6f * hs);
+            }
+            if (w->ResizableH()) for (float hy : { -1.5f, H + 1.5f }) {           // height handles
+                D2D1_RECT_F pr{ W / 2 - 15 * hs, hy - 3.5f * hs, W / 2 + 15 * hs, hy + 3.5f * hs };
+                g.FillRound(pr, 3.5f * hs, white); g.StrokeRound(pr, 3.5f * hs, acc, 1.6f * hs);
+            }
+            for (float cx : { -1.5f, W + 1.5f }) for (float cy : { -1.5f, H + 1.5f }) {   // scale handles
+                g.FillCircle(cx, cy, 6.5f * hs, white); g.StrokeCircle(cx, cy, 6.5f * hs, acc, 2.2f * hs);
+            }
+            if (!g_arrangeBadge.empty()) {
+                float tw = g.Measure(g_arrangeBadge, 12 * hs, DWRITE_FONT_WEIGHT_SEMI_BOLD) + 20 * hs;
+                D2D1_RECT_F br{ W / 2 - tw / 2, H + 9 * hs, W / 2 + tw / 2, H + 29 * hs };
+                g.FillRound(br, 10 * hs, D2D1_COLOR_F{ .08f, .08f, .10f, .88f });
+                bool sh = g.ink.shadow; g.ink.shadow = false;
+                g.Text(g_arrangeBadge, br, 12 * hs, DWRITE_FONT_WEIGHT_SEMI_BOLD, white, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                g.ink.shadow = sh;
+            }
+        }
+        else g.StrokeRound(fr, r, D2D1_COLOR_F{ 1, 1, 1, .65f }, 1.5f / w->size);
+    }
     HRESULT hr = g_gr.rt->EndDraw();
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) g_gr.DropTarget();
     GdiFlush();
@@ -134,7 +173,7 @@ static void Render(Widget* w) {
     HBITMAP dib = MakeDib(mem, w->bw, w->bh, &bits);
     if (dib && bits) {
         HGDIOBJ old = SelectObject(mem, dib);
-        DrawWidget(mem, w, t, w->bg.data(), w->bw, w->bh, w->margin, w->scale * w->size, w->lum);
+        DrawWidget(mem, w, t, w->bg.data(), w->bw, w->bh, w->margin, w->scale * w->size, w->lum, g_arranging);
         POINT dst{ w->x - w->margin, w->y - w->margin }, src{ 0, 0 };
         SIZE sz{ w->bw, w->bh };
         BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
@@ -246,13 +285,21 @@ static void ApplyEntry(Widget* w) {
     w->size = (float)Clamp(e->num(L"size", 1.0), 0.5, 3.0);
     if (e->get(L"theme")) w->theme = e->str(L"theme", L"");
     w->Load(*e);
+    w->cw = (float)e->num(L"w", 0); w->ch = (float)e->num(L"h", 0);
+    std::wstring a = e->str(L"anchor", L"");
+    if (a.size() == 2) {
+        w->hasAnchor = true;
+        w->anchor = (a[1] == L'r' ? 1 : 0) | (a[0] == L'b' ? 2 : 0);
+        w->adx = (float)e->num(L"dx", 0); w->ady = (float)e->num(L"dy", 0);
+        w->mon = e->str(L"monitor", L"");
+    }
 }
 static void SaveConfigNow() {
     JVal c = JVal::MakeObj();
     c.set(L"theme") = JVal::MakeStr(g_theme);
     c.set(L"accent") = JVal::MakeStr(g_accent);
     c.set(L"text") = JVal::MakeStr(g_textMode);
-    c.set(L"locked") = JVal::MakeBool(g_locked);
+    c.set(L"quickDrag") = JVal::MakeBool(g_quickDrag);
     c.set(L"snap") = JVal::MakeBool(g_snap);
     c.set(L"pauseFullscreen") = JVal::MakeBool(g_pauseFullscreen);
     c.set(L"settingsTheme") = JVal::MakeStr(g_uiTheme);
@@ -262,7 +309,15 @@ static void SaveConfigNow() {
         e.set(L"key") = JVal::MakeStr(w->key);
         e.set(L"enabled") = JVal::MakeBool(w->enabled);
         if (w->placed) { e.set(L"x") = JVal::MakeNum(w->x); e.set(L"y") = JVal::MakeNum(w->y); }
-        e.set(L"size") = JVal::MakeNum(w->size);
+        if (w->hasAnchor) {
+            const wchar_t* names[4] = { L"tl", L"tr", L"bl", L"br" };
+            e.set(L"anchor") = JVal::MakeStr(names[w->anchor & 3]);
+            e.set(L"dx") = JVal::MakeNum(std::round(w->adx * 10) / 10);
+            e.set(L"dy") = JVal::MakeNum(std::round(w->ady * 10) / 10);
+            e.set(L"monitor") = JVal::MakeStr(w->mon);
+        }
+        e.set(L"size") = JVal::MakeNum(std::round(w->size * 100) / 100);
+        if (w->cw > 0 || w->ch > 0) { D2D1_SIZE_F bs = w->BaseSize(); e.set(L"w") = JVal::MakeNum(std::round(bs.width)); e.set(L"h") = JVal::MakeNum(std::round(bs.height)); }
         if (w->theme != w->DefaultTheme()) e.set(L"theme") = JVal::MakeStr(w->theme);
         w->Save(e);
         arr.a.push_back(e);
@@ -280,7 +335,7 @@ static void LoadConfig() {
     g_theme = g_cfg.str(L"theme", L"liquid");
     g_accent = g_cfg.str(L"accent", L"system");
     g_textMode = g_cfg.str(L"text", L"auto");
-    g_locked = g_cfg.boolean(L"locked", false);
+    g_quickDrag = g_cfg.boolean(L"quickDrag", false);
     g_snap = g_cfg.boolean(L"snap", true);
     g_pauseFullscreen = g_cfg.boolean(L"pauseFullscreen", true);
     g_uiTheme = g_cfg.str(L"settingsTheme", L"system");
@@ -314,16 +369,151 @@ static void AutoPlace() {
             y = hit->y + (int)(hit->BaseSize().height * hit->size * s) + gap;
         }
         w->x = colRight - pw; w->y = y; w->placed = true;
+        UpdateAnchor(w.get());
         y += ph + gap; colW = std::max(colW, pw);
     }
 }
-static void EnsureOnScreen(Widget* w) {
-    RECT r{ w->x, w->y, w->x + PanelW(w), w->y + PanelH(w) };
-    HMONITOR m = MonitorFromRect(&r, MONITOR_DEFAULTTONULL);
+// ------------------------------------------------------------------ placement engine
+float ScaleOf(HMONITOR m) { UINT dx = 96, dy = 96; GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &dx, &dy); return dx / 96.f; }
+RECT WorkOf(HMONITOR m) { MONITORINFO mi{ sizeof(mi) }; GetMonitorInfoW(m, &mi); return mi.rcWork; }
+static HMONITOR MonitorAt(int x, int y) { POINT p{ x, y }; return MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST); }
+static SIZE PanelSizeAt(Widget* w, float s) {
+    D2D1_SIZE_F b = w->BaseSize();
+    return SIZE{ (LONG)std::ceil(b.width * w->size * s), (LONG)std::ceil(b.height * w->size * s) };
+}
+RECT PanelRect(Widget* w) {
+    SIZE z = PanelSizeAt(w, ScaleOf(MonitorAt(w->x + 8, w->y + 8)));
+    return RECT{ w->x, w->y, w->x + z.cx, w->y + z.cy };
+}
+void ClampWidget(Widget* w, int& x, int& y, const POINT* pref) {
+    HMONITOR m;
+    if (pref) m = MonitorFromPoint(*pref, MONITOR_DEFAULTTONEAREST);
+    else {
+        SIZE z0 = PanelSizeAt(w, ScaleOf(MonitorAt(x + 8, y + 8)));
+        RECT r{ x, y, x + z0.cx, y + z0.cy };
+        m = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+    }
+    float s = ScaleOf(m);
+    SIZE z = PanelSizeAt(w, s);
+    RECT wa = WorkOf(m);
+    int mg = (int)(8 * s);
+    x = std::max((int)wa.left + mg, std::min(x, (int)wa.right - mg - (int)z.cx));
+    y = std::max((int)wa.top + mg, std::min(y, (int)wa.bottom - mg - (int)z.cy));
+}
+void UpdateAnchor(Widget* w) {
+    RECT pr = PanelRect(w);
+    HMONITOR hm = MonitorFromRect(&pr, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW mi; mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hm, &mi)) return;
+    RECT wa = mi.rcWork;
+    float s = ScaleOf(hm);
+    bool right = (pr.left + pr.right) / 2 > (wa.left + wa.right) / 2, bottom = (pr.top + pr.bottom) / 2 > (wa.top + wa.bottom) / 2;
+    w->anchor = (right ? 1 : 0) | (bottom ? 2 : 0);
+    w->adx = (right ? wa.right - pr.right : pr.left - wa.left) / s;
+    w->ady = (bottom ? wa.bottom - pr.bottom : pr.top - wa.top) / s;
+    w->mon = mi.szDevice;
+    w->hasAnchor = true;
+}
+namespace { struct MonFind { std::wstring dev; HMONITOR found = nullptr; }; }
+static BOOL CALLBACK FindMonProc(HMONITOR m, HDC, LPRECT, LPARAM p) {
+    auto* f = (MonFind*)p;
+    MONITORINFOEXW mi; mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(m, &mi) && f->dev == mi.szDevice) { f->found = m; return FALSE; }
+    return TRUE;
+}
+static bool PositionFromAnchor(Widget* w) {
+    if (!w->hasAnchor) return false;
+    MonFind f; f.dev = w->mon;
+    if (!w->mon.empty()) EnumDisplayMonitors(nullptr, nullptr, FindMonProc, (LPARAM)&f);
+    HMONITOR hm = f.found;
+    if (!hm) { POINT o{ 0, 0 }; hm = MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY); }   // monitor gone: use the main one
+    float s = ScaleOf(hm);
+    RECT wa = WorkOf(hm);
+    SIZE z = PanelSizeAt(w, s);
+    w->x = (w->anchor & 1) ? wa.right - (int)std::lround(w->adx * s) - z.cx : wa.left + (int)std::lround(w->adx * s);
+    w->y = (w->anchor & 2) ? wa.bottom - (int)std::lround(w->ady * s) - z.cy : wa.top + (int)std::lround(w->ady * s);
+    w->placed = true;
+    return true;
+}
+static void ClampInPlace(Widget* w) { int x = w->x, y = w->y; ClampWidget(w, x, y, nullptr); w->x = x; w->y = y; }
+
+// Overlap resolution. Widgets are settled one by one (the `fixed` one first, it never moves);
+// a widget that collides with an already-settled one moves to the nearest spot that is completely free.
+static RECT RectAt(Widget* w, int x, int y) { SIZE z = PanelSizeAt(w, ScaleOf(MonitorAt(x + 8, y + 8))); return RECT{ x, y, x + z.cx, y + z.cy }; }
+static bool Collides(const RECT& r, const std::vector<RECT>& settled, int g) {
     RECT x;
-    MONITORINFO mi{ sizeof(mi) };
-    if (m && GetMonitorInfoW(m, &mi) && IntersectRect(&x, &r, &mi.rcWork) && (x.right - x.left) > 40 && (x.bottom - x.top) > 40) return;
-    w->placed = false;
+    for (auto& o : settled) { RECT ig{ o.left - g, o.top - g, o.right + g, o.bottom + g }; if (IntersectRect(&x, &r, &ig)) return true; }
+    return false;
+}
+static bool FindFreeSpot(Widget* w, const std::vector<RECT>& settled, int& outX, int& outY) {
+    RECT cur = RectAt(w, w->x, w->y);
+    HMONITOR hm = MonitorFromRect(&cur, MONITOR_DEFAULTTONEAREST);
+    float s = ScaleOf(hm);
+    RECT wa = WorkOf(hm);
+    int g = (int)(12 * s), pw = cur.right - cur.left, ph = cur.bottom - cur.top;
+    std::vector<POINT> cand;
+    for (auto& o : settled) {   // snug positions next to every settled widget
+        int xs[4] = { (int)o.right + g, (int)o.left - g - pw, (int)o.left, (int)o.right - pw };
+        int ys[4] = { (int)o.bottom + g, (int)o.top - g - ph, (int)o.top, (int)o.bottom - ph };
+        for (int xi : xs) cand.push_back(POINT{ xi, w->y });
+        for (int yi : ys) cand.push_back(POINT{ w->x, yi });
+        for (int xi : xs) for (int yi : ys) cand.push_back(POINT{ xi, yi });
+    }
+    int step = std::max(4, (int)(16 * s));   // plus a coarse scan of the whole screen
+    for (int yy = wa.top; yy < wa.bottom; yy += step) for (int xx = wa.left; xx < wa.right; xx += step) cand.push_back(POINT{ xx, yy });
+    // clamp + collide with plain arithmetic (no per-candidate API calls)
+    int mg = (int)(8 * s);
+    int minX = wa.left + mg, maxX = std::max(minX, (int)wa.right - mg - pw), minY = wa.top + mg, maxY = std::max(minY, (int)wa.bottom - mg - ph);
+    long long best = -1;
+    for (auto c : cand) {
+        int x = Clamp((int)c.x, minX, maxX), y = Clamp((int)c.y, minY, maxY);
+        if (Collides(RECT{ x, y, x + pw, y + ph }, settled, g)) continue;
+        long long dx = x - w->x, dy = y - w->y, d = dx * dx + dy * dy;
+        if (best < 0 || d < best) { best = d; outX = x; outY = y; }
+    }
+    return best >= 0;
+}
+void ResolveOverlaps(Widget* fixed, bool updateAnchors) {
+    std::vector<Widget*> order;
+    if (fixed && fixed->enabled && fixed->placed) order.push_back(fixed);
+    for (auto& w : g_widgets) if (w.get() != fixed && w->enabled && w->placed) order.push_back(w.get());
+    std::vector<RECT> settled;
+    for (Widget* w : order) {
+        ClampInPlace(w);
+        RECT r = RectAt(w, w->x, w->y);
+        int g = (int)(12 * ScaleOf(MonitorAt(w->x + 8, w->y + 8)));
+        int ox = w->x, oy = w->y;
+        if (w != fixed && Collides(r, settled, g)) {
+            int nx, ny;
+            if (FindFreeSpot(w, settled, nx, ny)) { w->x = nx; w->y = ny; }
+        }
+        if (w->x != ox || w->y != oy) {
+            if (w->hwnd) { Layout(w); Render(w); }
+            if (updateAnchors) UpdateAnchor(w);
+        }
+        settled.push_back(RectAt(w, w->x, w->y));
+    }
+}
+void LayoutWidget(Widget* w) { Layout(w); }
+void PreviewWidget(Widget* w) {
+    if (!w->enabled || !w->hwnd) return;
+    PositionFromAnchor(w);
+    ClampInPlace(w);
+    Layout(w); Render(w);
+}
+void RenderWidget(Widget* w) { Render(w); }
+void ScheduleRelease() { ArmRelease(); }
+
+// Re-derive every position after resolution / DPI / taskbar / monitor changes.
+static void RelayoutAll() {
+    for (auto& w : g_widgets) {
+        if (!w->enabled) continue;
+        PositionFromAnchor(w.get());
+        ClampInPlace(w.get());
+        if (w->hwnd) Layout(w.get());
+    }
+    ResolveOverlaps(nullptr, false);
+    for (auto& w : g_widgets) if (w->hwnd) Render(w.get());
 }
 
 // ------------------------------------------------------------------ widget windows
@@ -335,10 +525,9 @@ Widget::~Widget() {
 
 static void ShowWidget(Widget* w) {
     if (!w->enabled) { if (w->hwnd) { DestroyWindow(w->hwnd); w->hwnd = nullptr; } w->bg.clear(); w->bg.shrink_to_fit(); return; }
-    if (!w->placed) AutoPlace();
+    if (!PositionFromAnchor(w) && !w->placed) AutoPlace();
+    ClampInPlace(w);                     // never partly off-screen
     Layout(w);
-    EnsureOnScreen(w);
-    if (!w->placed) { AutoPlace(); Layout(w); }
     if (!w->hwnd) {
         w->hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"PrismWidget", w->title.c_str(), WS_POPUP,
                                   w->x - w->margin, w->y - w->margin, w->bw, w->bh, DesktopOwner(), nullptr, g_inst, nullptr);
@@ -346,8 +535,11 @@ static void ShowWidget(Widget* w) {
         SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
         Render(w);
         ShowWindow(w->hwnd, SW_SHOWNOACTIVATE);
-        SetWindowPos(w->hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    } else Render(w);
+        SetWindowPos(w->hwnd, g_arranging ? HWND_TOPMOST : HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else {
+        SetWindowPos(w->hwnd, nullptr, w->x - w->margin, w->y - w->margin, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        Render(w);
+    }
 }
 
 static void BuildWidgets() {
@@ -355,6 +547,7 @@ static void BuildWidgets() {
     g_widgets.push_back(MakeClock());
     g_widgets.push_back(MakeCalendar());
     g_widgets.push_back(MakeTodo());
+    g_widgets.push_back(MakeMedia());
     g_widgets.push_back(MakeSystem());
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((CustomWidgetDir() + L"\\*.json").c_str(), &fd);
@@ -364,6 +557,8 @@ static void BuildWidgets() {
     }
     for (auto& w : g_widgets) ApplyEntry(w.get());
     for (auto& w : g_widgets) ShowWidget(w.get());
+    ResolveOverlaps(nullptr, false);
+    for (auto& w : g_widgets) if (w->enabled && !w->hasAnchor) UpdateAnchor(w.get());   // migrate old x/y configs
 }
 
 void ReloadCustom() {
@@ -383,7 +578,8 @@ void ReloadCustom() {
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    for (auto& w : g_widgets) if (w->IsCustom()) ShowWidget(w.get());
+    for (auto& w : g_widgets) if (w->IsCustom()) { ShowWidget(w.get()); if (w->enabled && !w->hasAnchor) UpdateAnchor(w.get()); }
+    ResolveOverlaps(nullptr, true);
     ScheduleTick();
     RequestSave();
     SettingsRefresh(true);
@@ -409,11 +605,16 @@ static void Snap(Widget* w, int& x, int& y) {
 }
 
 // ------------------------------------------------------------------ services used by Settings
-void ApplyWidget(Widget* w) { ShowWidget(w); ScheduleTick(); RequestSave(); }
+void ApplyWidget(Widget* w) {
+    ShowWidget(w);                              // re-derives from its anchor, so growing keeps the anchored edge
+    if (w->enabled) { if (!w->hasAnchor) UpdateAnchor(w); ResolveOverlaps(w, true); }
+    ScheduleTick(); RequestSave();
+}
 void ApplyGlobal(bool rebuildGlass) { Widget_RenderAll(rebuildGlass); RequestSave(); }
 void ResetPositions() {
-    for (auto& w : g_widgets) w->placed = false;
+    for (auto& w : g_widgets) { w->placed = false; w->hasAnchor = false; }
     for (auto& w : g_widgets) ShowWidget(w.get());
+    ResolveOverlaps(nullptr, true);
     ScheduleTick(); RequestSave();
 }
 void FreeMemoryNow() { g_wall.Release(); g_gr.ClearFormats(); TrimMemory(); }
@@ -499,7 +700,7 @@ static void WidgetMenu(Widget* w, int cx, int cy) {
     for (int i = 0; i < g_themeCount; i++) AppendMenuW(th, MF_STRING | (w->theme == g_themes[i].id ? MF_CHECKED : 0), 211 + i, g_themes[i].name);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)th, L"Theme");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_locked ? MF_CHECKED : 0), 230, L"Lock positions");
+    AppendMenuW(m, MF_STRING, 230, g_arranging ? L"Finish arranging" : L"Arrange widgets\u2026");
     AppendMenuW(m, MF_STRING, 231, L"Hide this widget");
     AppendMenuW(m, MF_STRING, 232, L"Widget settings\u2026");
     POINT pt; GetCursorPos(&pt);
@@ -511,7 +712,7 @@ static void WidgetMenu(Widget* w, int cx, int cy) {
     if (id >= 201 && id <= 204) w->size = g_sizes[id - 201];
     else if (id == 210) w->theme.clear();
     else if (id >= 211 && id < 211 + g_themeCount) w->theme = g_themes[id - 211].id;
-    else if (id == 230) g_locked = !g_locked;
+    else if (id == 230) { if (g_arranging) EndArrange(); else StartArrange(); return; }
     else if (id == 231) { w->enabled = false; ShowWidget(w); RequestSave(); SettingsRefresh(true); return; }
     else if (id == 232) { OpenSettings(w); return; }
     else w->Command(id);
@@ -523,7 +724,17 @@ static void WidgetMenu(Widget* w, int cx, int cy) {
 }
 
 // ------------------------------------------------------------------ widget window proc
-static struct { Widget* w = nullptr; POINT start{}; int ox = 0, oy = 0; bool down = false, dragging = false; } g_drag;
+static struct { Widget* w = nullptr; POINT start{}; int ox = 0, oy = 0; bool down = false, dragging = false, resizing = false; } g_drag;
+static bool InPanel(Widget* w, float lx, float ly) { D2D1_SIZE_F b = w->BaseSize(); return lx >= 0 && ly >= 0 && lx < b.width && ly < b.height; }
+static Widget* WidgetPanelAt(POINT p, Widget* except) {
+    for (auto it = g_widgets.rbegin(); it != g_widgets.rend(); ++it) {
+        Widget* o = it->get();
+        if (o == except || !o->enabled || !o->hwnd) continue;
+        RECT r = PanelRect(o);
+        if (PtInRect(&r, p)) return o;
+    }
+    return nullptr;
+}
 
 static LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     Widget* w = (Widget*)GetWindowLongPtrW(h, GWLP_USERDATA);
@@ -532,50 +743,111 @@ static LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_WINDOWPOSCHANGING: {
         auto* p = (WINDOWPOS*)lp;
-        if (!(p->flags & SWP_NOZORDER)) p->hwndInsertAfter = HWND_BOTTOM;   // always stay on the desktop layer
+        if (!g_arranging && !(p->flags & SWP_NOZORDER)) p->hwndInsertAfter = HWND_BOTTOM;   // stay on the desktop layer
         return 0;
     }
+    case WM_LBUTTONDBLCLK:
+        if (g_arranging && w == g_arrangeSel) {
+            int zone = ArrangeZone(w, LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)));
+            if (zone >= 0) { ArrangeResetZone(w, zone); return 0; }
+        }
+        [[fallthrough]];
     case WM_LBUTTONDOWN:
+        if (g_arranging) {
+            float lx = LocalX(w, GET_X_LPARAM(lp)), ly = LocalY(w, GET_Y_LPARAM(lp));
+            POINT cp; GetCursorPos(&cp);
+            int zone = w == g_arrangeSel ? ArrangeZone(w, lx, ly) : -1;
+            if (zone >= 0) {   // resize / scale handle
+                SetCapture(h);
+                g_drag.w = w; g_drag.down = true; g_drag.dragging = false; g_drag.resizing = true;
+                ArrangeResizeBegin(w, zone, cp);
+                return 0;
+            }
+            if (!InPanel(w, lx, ly)) {   // click landed in this window's shadow margin: hand it to the widget really under the cursor
+                Widget* o = WidgetPanelAt(cp, w);
+                if (!o) { ArrangeSelect(nullptr); return 0; }
+                w = o; h = o->hwnd;
+            }
+            ArrangeSelect(w);
+        }
         SetCapture(h);
         g_drag.w = w; g_drag.down = true; g_drag.dragging = false;
         GetCursorPos(&g_drag.start); g_drag.ox = w->x; g_drag.oy = w->y;
         return 0;
     case WM_MOUSEMOVE: {
+        if (g_drag.down && g_drag.w == w && g_drag.resizing) {
+            POINT p; GetCursorPos(&p);
+            ArrangeResizeMove(w, p, (GetKeyState(VK_MENU) & 0x8000) != 0);
+            return 0;
+        }
         if (g_drag.down && g_drag.w == w) {
             POINT p; GetCursorPos(&p);
             int dx = p.x - g_drag.start.x, dy = p.y - g_drag.start.y;
-            if (!g_drag.dragging && !g_locked && (std::abs(dx) > 4 || std::abs(dy) > 4)) g_drag.dragging = true;
+            if (!g_drag.dragging && (g_arranging || g_quickDrag) && (std::abs(dx) > 4 || std::abs(dy) > 4)) g_drag.dragging = true;
             if (g_drag.dragging) {
                 int nx = g_drag.ox + dx, ny = g_drag.oy + dy;
-                if (g_snap && !(GetKeyState(VK_MENU) & 0x8000)) Snap(w, nx, ny);   // hold Alt to disable snapping
+                bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;   // hold Alt for free placement
+                if (g_arranging) { if (alt) ArrangeClearGuides(); else ArrangeSnap(w, nx, ny, p); }
+                else if (g_snap && !alt) Snap(w, nx, ny);
+                ClampWidget(w, nx, ny, &p);                        // never leaves the screen
                 if (nx != w->x || ny != w->y) { w->x = nx; w->y = ny; Layout(w); Render(w); }
             }
             return 0;
         }
         TRACKMOUSEEVENT t{ sizeof(t), TME_LEAVE, h, 0 }; TrackMouseEvent(&t);
-        if (w->Hover(LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)))) Render(w);
+        if (!g_arranging && w->Hover(LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)))) Render(w);
         return 0;
     }
     case WM_LBUTTONUP:
+        if (g_drag.down && g_drag.w == w && g_drag.resizing) {
+            g_drag.down = g_drag.resizing = false; g_drag.w = nullptr;
+            ReleaseCapture();
+            ArrangeResizeEnd(w);
+            return 0;
+        }
         if (g_drag.down && g_drag.w == w) {
             bool dragged = g_drag.dragging;
             g_drag.down = g_drag.dragging = false; g_drag.w = nullptr;
             ReleaseCapture();
-            if (dragged) { w->placed = true; RequestSave(); ArmRelease(); }
-            else if (w->Click(LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)))) { Render(w); RequestSave(); }
+            if (dragged) {
+                if (g_arranging) ArrangeClearGuides();
+                w->placed = true;
+                UpdateAnchor(w);
+                ResolveOverlaps(w, true);   // neighbours make room
+                RequestSave(); ArmRelease();
+            }
+            else if (!g_arranging && w->Click(LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)))) { Render(w); RequestSave(); }
         }
         return 0;
     case WM_CAPTURECHANGED:
-        if (g_drag.w == w && (HWND)lp != h) { if (g_drag.dragging) { w->placed = true; RequestSave(); } g_drag.down = g_drag.dragging = false; g_drag.w = nullptr; }
+        if (g_drag.w == w && (HWND)lp != h && g_drag.resizing) {
+            g_drag.down = g_drag.resizing = false; g_drag.w = nullptr;
+            ArrangeResizeEnd(w);
+            return 0;
+        }
+        if (g_drag.w == w && (HWND)lp != h) {
+            if (g_drag.dragging) { if (g_arranging) ArrangeClearGuides(); w->placed = true; UpdateAnchor(w); ResolveOverlaps(w, true); RequestSave(); }
+            g_drag.down = g_drag.dragging = false; g_drag.w = nullptr;
+        }
         return 0;
-    case WM_MOUSELEAVE: w->Leave(); Render(w); return 0;
+    case WM_MOUSELEAVE: if (!g_arranging) { w->Leave(); Render(w); } return 0;
     case WM_MOUSEWHEEL: {
         POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(h, &p);
-        if (w->Wheel(LocalX(w, p.x), LocalY(w, p.y), GET_WHEEL_DELTA_WPARAM(wp))) Render(w);
+        if (!g_arranging && w->Wheel(LocalX(w, p.x), LocalY(w, p.y), GET_WHEEL_DELTA_WPARAM(wp))) Render(w);
         return 0;
     }
     case WM_RBUTTONUP: WidgetMenu(w, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
-    case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, IDC_ARROW)); return TRUE;
+    case WM_SETCURSOR: {
+        LPCWSTR cur = g_quickDrag ? IDC_SIZEALL : IDC_ARROW;
+        if (g_arranging) {
+            POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
+            float lx = LocalX(w, p.x), ly = LocalY(w, p.y);
+            int zone = (w == g_arrangeSel || (g_drag.resizing && g_drag.w == w)) ? ArrangeZone(w, lx, ly) : -1;
+            cur = zone >= 0 ? ArrangeZoneCursor(zone) : (InPanel(w, lx, ly) ? IDC_SIZEALL : IDC_ARROW);
+        }
+        SetCursor(LoadCursorW(nullptr, cur));
+        return TRUE;
+    }
     case WM_DPICHANGED: Layout(w); Render(w); return 0;
     }
     return DefWindowProcW(h, m, wp, lp);
@@ -620,7 +892,7 @@ void CreateNewWidget() {
 static void ShowHelp() {
     std::wstring msg =
         L"Prism Widgets " APP_VERSION L"\n\n"
-        L"• Drag a widget to move it (hold Alt to turn off snapping).\n"
+        L"\u2022 To move widgets, choose Arrange widgets (tray, right-click or Settings), then drag. Esc or Done to finish.\n"
         L"• Right-click a widget for its options, size and theme.\n"
         L"• Right-click the tray icon to show/hide widgets, change the theme, accent and Start with Windows.\n"
         L"• Custom widgets are JSON files in:\n   " + CustomWidgetDir() + L"\n"
@@ -660,7 +932,7 @@ static void ShowTrayMenu() {
     AppendMenuW(xm, MF_STRING | (g_textMode == L"dark" ? MF_CHECKED : 0), 1172, L"Dark text");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)xm, L"Text colour");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_locked ? MF_CHECKED : 0), 1180, L"Lock widget positions");
+    AppendMenuW(m, MF_STRING, 1180, g_arranging ? L"Finish arranging" : L"Arrange widgets\u2026");
     AppendMenuW(m, MF_STRING, 1181, L"Reset widget positions");
     AppendMenuW(m, MF_STRING | (IsStartup() ? MF_CHECKED : 0), 1182, L"Start with Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -679,7 +951,7 @@ static void ShowTrayMenu() {
     else if (id == 1150) { g_accent = L"system"; Widget_RenderAll(true); RequestSave(); }
     else if (id > 1150 && id < 1170) { g_accent = g_accents[id - 1151].hex; Widget_RenderAll(true); RequestSave(); }
     else if (id >= 1170 && id <= 1172) { g_textMode = id == 1170 ? L"auto" : id == 1171 ? L"light" : L"dark"; Widget_RenderAll(false); RequestSave(); }
-    else if (id == 1180) { g_locked = !g_locked; RequestSave(); }
+    else if (id == 1180) { if (g_arranging) EndArrange(); else StartArrange(); return; }
     else if (id == 1181) ResetPositions();
     else if (id == 1182) SetStartup(!IsStartup());
     else if (id == 1190) ShowHelp();
@@ -694,8 +966,9 @@ static void ShowTrayMenu() {
 static void ReloadWallpaper() {
     g_wall.Release();
     g_wallSig = g_wall.Signature();
-    for (auto& w : g_widgets) if (w->hwnd) { Layout(w.get()); }
-    Widget_RenderAll(true);
+    for (auto& w : g_widgets) w->bgValid = false;
+    RelayoutAll();   // resolution / DPI / monitor changes keep widgets anchored and on-screen
+    ScheduleTick();
 }
 
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -712,7 +985,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         case T_TICK: KillTimer(h, T_TICK); OnTick(); break;
         case T_RELEASE:   // drop wallpaper proxies + trim working set once idle
             KillTimer(h, T_RELEASE);
-            if (!g_drag.dragging) { g_wall.Release(); g_gr.ClearFormats(); TrimMemory(); }
+            if (!g_drag.dragging && !g_arranging) { g_wall.Release(); g_gr.ClearFormats(); TrimMemory(); }
             break;
         case T_SAVE: KillTimer(h, T_SAVE); SaveConfigNow(); break;
         case T_WALLCHECK: { std::wstring s = g_wall.Signature(); if (s != g_wallSig) ReloadWallpaper(); break; }
@@ -727,13 +1000,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_SHOWSETTINGS: OpenSettings(); return 0;
+    case WM_STARTARRANGE: StartArrange(); return 0;
     case WM_APP + 9: if (g_input.wnd && GetForegroundWindow() != g_input.wnd) CloseInput(true); return 0;
     case WM_SETTINGCHANGE:
         if (wp == SPI_SETDESKWALLPAPER) SetTimer(h, T_WALLRELOAD, 700, nullptr);
-        else if (wp == SPI_SETWORKAREA) { for (auto& w : g_widgets) if (w->hwnd) { EnsureOnScreen(w.get()); if (!w->placed) ShowWidget(w.get()); } }
+        else if (wp == SPI_SETWORKAREA) { EndArrange(); RelayoutAll(); }
         else if (lp && !wcscmp((const wchar_t*)lp, L"ImmersiveColorSet") && g_accent == L"system") Widget_RenderAll(true);
         return 0;
-    case WM_DISPLAYCHANGE: SetTimer(h, T_WALLRELOAD, 1000, nullptr); return 0;
+    case WM_DISPLAYCHANGE: EndArrange(); SetTimer(h, T_WALLRELOAD, 1000, nullptr); return 0;
     case WM_TIMECHANGE: Widget_RenderAll(false); return 0;
     case WM_WTSSESSION_CHANGE:
         if (wp == WTS_SESSION_LOCK) g_sessionLocked = true;
@@ -749,6 +1023,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         } else if (wp == PBT_APMRESUMEAUTOMATIC) Widget_RenderAll(false);
         return TRUE;
     case WM_DESTROY:
+        EndArrange();
         CloseSettings();
         SaveConfigNow();
         TrayRemove();
@@ -779,7 +1054,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
         if (other) {
             DWORD pid = 0; GetWindowThreadProcessId(other, &pid);
             AllowSetForegroundWindow(pid);
-            if (!(cmd && wcsstr(cmd, L"--startup"))) PostMessageW(other, WM_SHOWSETTINGS, 0, 0);
+            if (cmd && wcsstr(cmd, L"--arrange")) PostMessageW(other, WM_STARTARRANGE, 0, 0);
+            else if (!(cmd && wcsstr(cmd, L"--startup"))) PostMessageW(other, WM_SHOWSETTINGS, 0, 0);
         }
         return 0;
     }
@@ -788,7 +1064,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     BeLightweight();
 
     bool startup = cmd && wcsstr(cmd, L"--startup");
-    bool hidden = startup || (cmd && wcsstr(cmd, L"--hidden"));
+    bool arrange = cmd && wcsstr(cmd, L"--arrange");
+    bool hidden = startup || arrange || (cmd && wcsstr(cmd, L"--hidden"));
     if (startup) for (int i = 0; i < 60 && !FindWindowW(L"Progman", nullptr); i++) Sleep(500);   // wait for Explorer
 
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -796,7 +1073,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     RegisterClassExW(&wc);
     wc.lpfnWndProc = WidgetProc; wc.lpszClassName = L"PrismWidget"; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.style = CS_DBLCLKS;
     RegisterClassExW(&wc);
+    wc.style = 0;
     wc.lpfnWndProc = InputProc; wc.lpszClassName = L"PrismInput";
     RegisterClassExW(&wc);
     RegisterSettingsClass();
@@ -814,11 +1093,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     LoadTodos();
     g_wallSig = g_wall.Signature();
     BuildWidgets();
-    if (g_firstRun) SaveConfigNow();
+    if (g_firstRun) SaveConfigNow(); else RequestSave();   // persist any clamping / migrated anchors
     bool showWelcome = g_firstRun;
     g_firstRun = false;   // custom widgets added from now on start enabled
     TrayAdd(showWelcome && hidden);
     if (!hidden) OpenSettings();
+    if (arrange) PostMessageW(g_main, WM_STARTARRANGE, 0, 0);
     ScheduleTick();
     SetTimer(g_main, T_WALLCHECK, 60000, nullptr);   // catches slideshow / Spotlight wallpaper changes
     ArmRelease();
@@ -844,6 +1124,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     }
     if (g_dirWatch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(g_dirWatch);
     g_widgets.clear();
+    g_media.Shutdown();
     if (pn) UnregisterPowerSettingNotification(pn);
     WTSUnRegisterSessionNotification(g_main);
     g_gr.DropTarget(); g_gr.ClearFormats();

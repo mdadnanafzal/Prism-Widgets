@@ -1,5 +1,6 @@
 // Built-in widgets (clock, calendar, to-do, system) + JSON custom widgets.
 #include "widgets.h"
+#include "media.h"
 
 Graphics g_gr;
 
@@ -130,29 +131,47 @@ public:
     bool analog = false, seconds = false, showDate = true; int h24 = -1; // -1 = follow Windows
     ClockWidget() { key = L"clock"; title = L"Clock"; }
     bool Use24() { return h24 < 0 ? LocaleUses24h() : h24 == 1; }
-    D2D1_SIZE_F BaseSize() override { return analog ? D2D1_SIZE_F{ 210, 210 } : D2D1_SIZE_F{ 330, 150 }; }
+    D2D1_SIZE_F DefaultSize() override { return analog ? D2D1_SIZE_F{ 210, 210 } : D2D1_SIZE_F{ 330, 150 }; }
+    D2D1_SIZE_F MinSize() override { return analog ? D2D1_SIZE_F{ 130, 130 } : D2D1_SIZE_F{ 170, 80 }; }
+    D2D1_SIZE_F MaxSize() override { return analog ? D2D1_SIZE_F{ 440, 440 } : D2D1_SIZE_F{ 680, 330 }; }
+    void SetStyle(bool a) { if (a != analog) { analog = a; cw = ch = 0; } }   // each style has its own natural shape
     int Interval() override { return seconds ? 1000 : 60000; }
     void Draw(Gfx& g, float W, float H) override {
         SYSTEMTIME st; GetLocalTime(&st);
         if (analog) { DrawAnalog(g, W, H, st); return; }
         bool t24 = Use24();
         std::wstring tm = FormatDateTime(st, t24 ? L"HH:mm" : L"h:mm");
-        const float big = 70, top = 10, left = 24;
+        // adaptive layout: the time fills the space above the date and shrinks to fit the width
+        bool date = showDate && H >= 104;
+        float dateH = date ? 44.f : 0.f, left = std::min(24.f, W * 0.08f);
+        float big = std::max(24.f, (H - dateH) / 1.48f);
+        auto extra = [&](float b) {
+            float e = 0;
+            if (seconds) e = std::max(e, g.Measure(L"88", b * 0.37f, DWRITE_FONT_WEIGHT_NORMAL, FONT_DISPLAY));
+            if (!t24) e = std::max(e, g.Measure(L"PM", std::max(11.f, b * 0.21f), DWRITE_FONT_WEIGHT_SEMI_BOLD));
+            return e > 0 ? e + 8 : 0.f;
+        };
+        float tw = g.Measure(tm, big, DWRITE_FONT_WEIGHT_LIGHT, FONT_DISPLAY), avail = W - 2 * left;
+        float need = tw + extra(big);
+        if (need > avail && need > 0) { big *= avail / need; tw = g.Measure(tm, big, DWRITE_FONT_WEIGHT_LIGHT, FONT_DISPLAY); }
+        float top = std::max(2.f, (H - dateH - big * 1.33f) / 2 + (date ? 4.f : 0.f));
         g.Text(tm, RectF(left, top, W, top + big * 1.4f), big, DWRITE_FONT_WEIGHT_LIGHT, g.ink.fg,
                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, FONT_DISPLAY);
-        float tw = g.Measure(tm, big, DWRITE_FONT_WEIGHT_LIGHT, FONT_DISPLAY);
         float sx = left + tw + 8;
-        if (!t24) g.Text(st.wHour < 12 ? L"AM" : L"PM", RectF(sx, top + big * 0.36f, W, top + big), 15, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2);
+        if (!t24) { float ap = std::max(11.f, big * 0.21f); g.Text(st.wHour < 12 ? L"AM" : L"PM", RectF(sx, top + big * 0.36f, W, top + big * 0.36f + ap * 1.5f), ap, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2); }
         if (seconds) {
             wchar_t b[8]; swprintf(b, 8, L"%02d", st.wSecond);
-            float sz = 26, sTop = top + big * 1.06f - sz * 1.06f;
+            float sz = big * 0.37f, sTop = top + big * 1.06f - sz * 1.06f;
             g.Text(b, RectF(sx, sTop, W, sTop + sz * 1.4f), sz, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2,
                    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, FONT_DISPLAY);
         }
-        if (showDate) g.Text(FormatDateTime(st, L"dddd, d MMMM"), RectF(left + 3, H - 46, W - 20, H - 16), 16, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2);
+        if (date) {
+            const wchar_t* fmt = W >= 430 ? L"dddd, d MMMM yyyy" : W >= 250 ? L"dddd, d MMMM" : L"ddd, d MMM";
+            g.Text(FormatDateTime(st, fmt), RectF(left + 3, H - 46, W - left, H - 16), 16, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2);
+        }
     }
     void DrawAnalog(Gfx& g, float W, float H, const SYSTEMTIME& st) {
-        float cx = W / 2, cy = H / 2, R = std::min(W, H) / 2 - 22;
+        float cx = W / 2, cy = H / 2, R = std::min(W, H) / 2 - std::min(22.f, std::min(W, H) * 0.1f);
         for (int i = 0; i < 60; i++) {
             float a = i * 6 * 3.14159265f / 180, s = std::sin(a), c = -std::cos(a);
             bool hour = i % 5 == 0, q = i % 15 == 0;
@@ -178,7 +197,7 @@ public:
     }
     std::wstring Description() override { return L"Digital or analog time with the date"; }
     void Options(std::vector<Opt>& o) override {
-        o.push_back({ Opt::Choice, L"Style", L"", { L"Digital", L"Analog" }, [this] { return analog ? 1 : 0; }, [this](int v) { analog = v == 1; } });
+        o.push_back({ Opt::Choice, L"Style", L"", { L"Digital", L"Analog" }, [this] { return analog ? 1 : 0; }, [this](int v) { SetStyle(v == 1); } });
         o.push_back({ Opt::Toggle, L"Show seconds", L"Redraws every second instead of once a minute", {}, [this] { return seconds ? 1 : 0; }, [this](int v) { seconds = v != 0; } });
         o.push_back({ Opt::Toggle, L"24-hour time", L"", {}, [this] { return Use24() ? 1 : 0; }, [this](int v) { h24 = v ? 1 : 0; } });
         o.push_back({ Opt::Toggle, L"Show date", L"", {}, [this] { return showDate ? 1 : 0; }, [this](int v) { showDate = v != 0; } });
@@ -192,7 +211,7 @@ public:
         AddCheck(m, 105, L"Show date", showDate);
     }
     void Command(int id) override {
-        if (id == 101) analog = false; else if (id == 102) analog = true;
+        if (id == 101) SetStyle(false); else if (id == 102) SetStyle(true);
         else if (id == 103) seconds = !seconds;
         else if (id == 104) h24 = Use24() ? 0 : 1;
         else if (id == 105) showDate = !showDate;
@@ -214,7 +233,38 @@ public:
     int hoverPart = -1;   // 0 prev, 1 next, 2 header, 10+ day cell
     int firstDay = -1;    // -1 = locale
     CalendarWidget() { key = L"calendar"; title = L"Calendar"; }
-    D2D1_SIZE_F BaseSize() override { return D2D1_SIZE_F{ 300, 300 }; }
+    D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ 300, 300 }; }
+    D2D1_SIZE_F MinSize() override { return D2D1_SIZE_F{ 150, 120 }; }
+    D2D1_SIZE_F MaxSize() override { return D2D1_SIZE_F{ 600, 600 }; }
+    static bool Compact(float W, float H) { return W < 236 || H < 228; }
+    static bool Weeks(float W) { return W >= 370; }
+    struct GridGeo { float gx, cw, gy, ch; };
+    static GridGeo Grid(float W, float H) {
+        GridGeo r; r.gx = Weeks(W) ? 44.f : 12.f; r.cw = (W - r.gx - 12) / 7; r.gy = 82; r.ch = (H - r.gy - 12) / 6; return r;
+    }
+    static long long DayIndex(int y, int m, int d) {
+        SYSTEMTIME s{}; s.wYear = (WORD)y; s.wMonth = (WORD)m; s.wDay = (WORD)d; FILETIME f; SystemTimeToFileTime(&s, &f);
+        return (long long)((((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime) / 864000000000ULL);
+    }
+    static SYSTEMTIME FromIndex(long long idx) {
+        ULONGLONG v = (ULONGLONG)idx * 864000000000ULL; FILETIME f{ (DWORD)v, (DWORD)(v >> 32) }; SYSTEMTIME s; FileTimeToSystemTime(&f, &s); return s;
+    }
+    static int IsoWeek(long long idx) {   // ISO-8601 week of the day with this index
+        SYSTEMTIME s = FromIndex(idx);
+        int dow = (s.wDayOfWeek + 6) % 7;
+        long long thu = idx - dow + 3;
+        SYSTEMTIME t = FromIndex(thu);
+        return (int)((thu - DayIndex(t.wYear, 1, 1)) / 7) + 1;
+    }
+    void DrawCompact(Gfx& g, float W, float H) {
+        SYSTEMTIME now; GetLocalTime(&now);
+        std::wstring wd = FormatDateTime(now, L"dddd"); for (auto& c : wd) c = towupper(c);
+        g.Text(wd, RectF(16, 12, W - 12, 32), 12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.accentText);
+        float big = Clamp(std::min(H - 70, W * 0.6f), 30.f, 140.f);
+        g.Text(std::to_wstring(now.wDay), RectF(14, 28, W - 10, 28 + big * 1.3f), big, DWRITE_FONT_WEIGHT_LIGHT, g.ink.fg,
+               DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, FONT_DISPLAY);
+        g.Text(FormatDateTime(now, W >= 190 ? L"MMMM yyyy" : L"MMM yyyy"), RectF(16, H - 36, W - 12, H - 14), 13.5f, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2);
+    }
     int FirstDay() { return firstDay < 0 ? LocaleFirstDayOfWeek() : firstDay; } // 0 = Monday
     static int DaysIn(int y, int m) { static const int d[] = { 31,28,31,30,31,30,31,31,30,31,30,31 }; return m == 2 && ((y % 4 == 0 && y % 100) || y % 400 == 0) ? 29 : d[m - 1]; }
     static int Dow(int y, int m, int d) { // 0 = Monday
@@ -228,6 +278,7 @@ public:
     D2D1_RECT_F Prev(float W) { return RectF(W - 76, 14, W - 46, 44); }
     D2D1_RECT_F Next(float W) { return RectF(W - 44, 14, W - 14, 44); }
     void Draw(Gfx& g, float W, float H) override {
+        if (Compact(W, H)) { DrawCompact(g, W, H); return; }
         SYSTEMTIME now; GetLocalTime(&now);
         int y, m; View(y, m);
         SYSTEMTIME first{}; first.wYear = (WORD)y; first.wMonth = (WORD)m; first.wDay = 1;
@@ -237,7 +288,8 @@ public:
         if (hoverPart == 1) g.FillRound(Next(W), 8, g.ink.hover);
         g.Icon(0xE76B, Prev(W), 11, g.ink.fg2);
         g.Icon(0xE76C, Next(W), 11, g.ink.fg2);
-        float gx = 12, cw = (W - 24) / 7, gy = 82, ch = (H - gy - 12) / 6;
+        GridGeo G = Grid(W, H);
+        float gx = G.gx, cw = G.cw, gy = G.gy, ch = G.ch;
         int fd = FirstDay();
         for (int i = 0; i < 7; i++) {
             int dow = (fd + i) % 7; // 0 Monday
@@ -246,6 +298,14 @@ public:
             g.Text(nm, RectF(gx + i * cw, 56, gx + (i + 1) * cw, 76), 11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_CENTER);
         }
         int lead = (Dow(y, m, 1) - fd + 7) % 7;
+        if (Weeks(W)) {   // ISO week numbers (taken from each row's Thursday)
+            g.Text(L"Wk", RectF(10, 56, gx - 4, 76), 11, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_CENTER);
+            long long first = DayIndex(y, m, 1);
+            int thuCol = (3 - fd + 7) % 7;
+            for (int r = 0; r < 6; r++)
+                g.Text(std::to_wstring(IsoWeek(first + r * 7 + thuCol - lead)), RectF(10, gy + r * ch, gx - 4, gy + (r + 1) * ch), 11,
+                       DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
         int dim = DaysIn(y, m), py = m == 1 ? y - 1 : y, pm = m == 1 ? 12 : m - 1, pdim = DaysIn(py, pm);
         for (int c = 0; c < 42; c++) {
             int day = c - lead + 1; bool cur = day >= 1 && day <= dim;
@@ -263,10 +323,12 @@ public:
     }
     int Part(float x, float y) {
         float W = BaseSize().width, H = BaseSize().height;
+        if (Compact(W, H)) return -1;
         if (In(Prev(W), x, y)) return 0;
         if (In(Next(W), x, y)) return 1;
         if (y >= 14 && y < 44 && x < W - 80) return 2;
-        float gx = 12, cw = (W - 24) / 7, gy = 82, ch = (H - gy - 12) / 6;
+        GridGeo G = Grid(W, H);
+        float gx = G.gx, cw = G.cw, gy = G.gy, ch = G.ch;
         if (x >= gx && x < W - 12 && y >= gy && y < H - 12) return 10 + (int)((y - gy) / ch) * 7 + (int)((x - gx) / cw);
         return -1;
     }
@@ -277,7 +339,7 @@ public:
         if (p == 2 && offset) { offset = 0; return true; }
         return false;
     }
-    bool Wheel(float, float, int d) override { offset += d > 0 ? -1 : 1; return true; }
+    bool Wheel(float, float, int d) override { if (Compact(BaseSize().width, BaseSize().height)) return false; offset += d > 0 ? -1 : 1; return true; }
     bool Hover(float x, float y) override { int p = Part(x, y); if (p == hoverPart) return false; hoverPart = p; return true; }
     void Leave() override { hoverPart = -1; }
     std::wstring Description() override { return L"Month view with today highlighted"; }
@@ -304,7 +366,7 @@ void LoadTodos() {
     g_todos.clear();
     JVal v; bool ok = false; std::wstring t = ReadTextFile(TodoPath(), &ok);
     if (!ok) {  // first run
-        g_todos = { { L"Right-click a widget for options", false }, { L"Drag widgets anywhere on the desktop", false }, { L"Try the Liquid Glass theme", true } };
+        g_todos = { { L"Right-click a widget for options", false }, { L"Right-click a widget \u2192 Arrange widgets to move them", false }, { L"Try the Liquid Glass theme", true } };
         return;
     }
     if (JsonParse(t, v) && v.isArr())
@@ -323,7 +385,9 @@ public:
     bool hideDone = false;
     const float top = 56, rowH = 34;
     TodoWidget() { key = L"todo"; title = L"To-Do"; }
-    D2D1_SIZE_F BaseSize() override { return D2D1_SIZE_F{ 300, 330 }; }
+    D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ 300, 330 }; }
+    D2D1_SIZE_F MinSize() override { return D2D1_SIZE_F{ 220, 160 }; }
+    D2D1_SIZE_F MaxSize() override { return D2D1_SIZE_F{ 600, 900 }; }
     std::vector<int> Visible() { std::vector<int> v; for (int i = 0; i < (int)g_todos.size(); i++) if (!hideDone || !g_todos[i].done) v.push_back(i); return v; }
     int Rows() { return (int)((BaseSize().height - 52 - top) / rowH); }
     D2D1_RECT_F AddRect() { float W = BaseSize().width, H = BaseSize().height; return RectF(12, H - 48, W - 12, H - 12); }
@@ -424,12 +488,156 @@ public:
     void Save(JVal& o) override { o.set(L"hideDone") = JVal::MakeBool(hideDone); }
 };
 
+// ======================================================================= Media (now playing)
+class MediaWidget : public Widget {
+public:
+    bool showArt = true, showProgress = true;
+    int hover = -1;                 // 0 prev, 1 play/pause, 2 next
+    ID2D1Bitmap* bmp = nullptr; int bmpGen = -1, bmpVer = -1;
+    MediaWidget() { key = L"media"; title = L"Media Controls"; }
+    ~MediaWidget() override { SafeRelease(bmp); }
+    D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ 360, 156 }; }
+    D2D1_SIZE_F MinSize() override { return D2D1_SIZE_F{ 200, 130 }; }
+    D2D1_SIZE_F MaxSize() override { return D2D1_SIZE_F{ 620, 480 }; }
+    int Interval() override { return g_media.Busy() ? 250 : (g_media.st.playing ? 1000 : 2000); }
+    std::wstring Description() override { return L"Now playing, with play/pause, next and previous"; }
+    // Adaptive layout: 0 normal (art left), 1 narrow (small art), 2 tall album card (art on top)
+    struct Geo { int mode; D2D1_RECT_F art; float x0, x1, yApp, yTitle, yArtist, titleSz, yProg, yBtn, gap, bx0, bx1; bool prog; };
+    Geo Lay(float W, float H) {
+        Geo G{};
+        G.mode = (H >= 250 && W <= H * 1.35f) ? 2 : (W >= 280 ? 0 : 1);
+        G.titleSz = G.mode == 1 ? 14.5f : 16.5f;
+        G.yBtn = H - (G.mode == 1 ? 30.f : 34.f);
+        if (G.mode == 2) {
+            float side = showArt ? std::max(0.f, std::min(W - 28, H - 176)) : 0;
+            G.art = RectF((W - side) / 2, 14, (W + side) / 2, 14 + side);
+            G.x0 = 18; G.x1 = W - 18;
+            float ty = showArt ? 14 + side + 10 : 18;
+            G.yApp = ty; G.yTitle = ty + 16; G.yArtist = ty + 40;
+            G.bx0 = G.x0; G.bx1 = G.x1;
+        } else if (G.mode == 0) {
+            float side = std::min(std::min(H - 28, W * 0.42f), 230.f);
+            G.art = RectF(14, (H - side) / 2, 14 + side, (H + side) / 2);
+            G.x0 = showArt ? 28 + side : 22; G.x1 = W - 18;
+            G.yApp = 14; G.yTitle = 30; G.yArtist = 54;
+            G.bx0 = G.x0; G.bx1 = W - 16;
+        } else {
+            G.art = RectF(14, 14, 54, 54);
+            G.x0 = showArt ? 64 : 18; G.x1 = W - 16;
+            G.yApp = 14; G.yTitle = 28; G.yArtist = 48;
+            G.bx0 = 16; G.bx1 = W - 16;
+        }
+        G.yProg = G.yBtn - 38;
+        G.prog = showProgress && G.yProg >= G.yArtist + 26;
+        G.gap = std::min(58.f, (G.bx1 - G.bx0) / 3.2f);
+        return G;
+    }
+    D2D1_POINT_2F Btn(const Geo& G, int i) { return D2D1_POINT_2F{ (G.bx0 + G.bx1) / 2 + (i - 1) * G.gap, G.yBtn }; }
+    static std::wstring Time(long long t) {
+        long long sec = t / 10000000; wchar_t b[32];
+        if (sec >= 3600) swprintf(b, 32, L"%lld:%02lld:%02lld", sec / 3600, (sec / 60) % 60, sec % 60);
+        else swprintf(b, 32, L"%lld:%02lld", sec / 60, sec % 60);
+        return b;
+    }
+    void Draw(Gfx& g, float W, float H) override {
+        g_media.Pump();
+        const MediaState& m = g_media.st;
+        Geo G = Lay(W, H);
+        if (showArt && G.art.right - G.art.left > 4) {
+            D2D1_RECT_F ar = G.art;
+            float rad = std::min(14.f, (ar.right - ar.left) * 0.12f);
+            if (!m.art.empty()) {
+                if (bmp && (bmpGen != g_gr.generation || bmpVer != m.artVersion)) SafeRelease(bmp);
+                if (!bmp) {
+                    D2D1_BITMAP_PROPERTIES bp{ { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, 96, 96 };
+                    g.rt->CreateBitmap(D2D1_SIZE_U{ (UINT32)m.artW, (UINT32)m.artH }, m.art.data(), m.artW * 4, &bp, &bmp);
+                    bmpGen = g_gr.generation; bmpVer = m.artVersion;
+                }
+            } else SafeRelease(bmp);
+            if (bmp) {
+                ID2D1BitmapBrush* bb = nullptr;
+                g.rt->CreateBitmapBrush(bmp, &bb);
+                if (bb) {
+                    float k = (ar.right - ar.left) / m.artW;
+                    D2D1_MATRIX_3X2_F t; t._11 = k; t._12 = 0; t._21 = 0; t._22 = k; t._31 = ar.left; t._32 = ar.top;
+                    bb->SetTransform(&t);
+                    D2D1_ROUNDED_RECT rr{ ar, rad, rad };
+                    g.rt->FillRoundedRectangle(&rr, bb);
+                    bb->Release();
+                }
+                g.StrokeRound(ar, rad, D2D1_COLOR_F{ 1, 1, 1, .12f }, 1);
+            } else {
+                g.FillRound(ar, rad, Alpha(g.ink.accent, .28f));
+                g.StrokeRound(ar, rad, Alpha(g.ink.fg, .10f), 1);
+                g.Icon(0xE8D6, ar, std::max(14.f, (ar.right - ar.left) * 0.31f), Alpha(g.ink.fg, .75f));
+            }
+        }
+        float x0 = G.x0, x1 = G.x1;
+        std::wstring app = m.hasSession ? m.app : (m.available ? L"Media" : L"Media keys");
+        for (auto& c : app) c = towupper(c);
+        g.Text(app, RectF(x0, G.yApp, x1 - 20, G.yApp + 16), 11, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg3);
+        if (m.playing) {   // tiny equaliser glyph
+            float ey = G.yApp + 12;
+            for (int i = 0; i < 3; i++) { float h = (i == 1 ? 9.f : 6.f); g.FillRound(RectF(x1 - 14 + i * 5, ey - h, x1 - 11 + i * 5, ey), 1, g.ink.accentText); }
+        }
+        bool has = m.hasSession && !m.title.empty();
+        g.Text(has ? m.title : L"Nothing playing", RectF(x0, G.yTitle, x1, G.yTitle + G.titleSz * 1.45f), G.titleSz, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg);
+        g.Text(has ? m.artist : L"Spotify, YouTube, Media Player…", RectF(x0, G.yArtist, x1, G.yArtist + 20), 13, DWRITE_FONT_WEIGHT_NORMAL, has ? g.ink.fg2 : g.ink.fg3);
+        if (G.prog && m.hasSession && m.end > 0) {
+            long long pos = g_media.Position();
+            float f = Clamp((float)((double)pos / (double)m.end), 0.f, 1.f), by = G.yProg;
+            float px0 = G.mode == 0 ? x0 : G.bx0, px1 = G.mode == 0 ? x1 : G.bx1;
+            g.FillRound(RectF(px0, by, px1, by + 4), 2, Alpha(g.ink.fg, .16f));
+            if (f > 0) g.FillRound(RectF(px0, by, px0 + std::max(4.f, (px1 - px0) * f), by + 4), 2, g.ink.fg);
+            g.Text(Time(pos), RectF(px0, by + 7, px0 + 80, by + 21), 10.5f, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3);
+            g.Text(Time(m.end), RectF(px1 - 80, by + 7, px1, by + 21), 10.5f, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        const wchar_t glyphs[3] = { 0xE892, (wchar_t)(m.playing ? 0xE769 : 0xE768), 0xE893 };
+        bool en[3] = { !m.hasSession || m.canPrev, !m.hasSession || m.canPlayPause, !m.hasSession || m.canNext };
+        for (int i = 0; i < 3; i++) {
+            D2D1_POINT_2F c = Btn(G, i);
+            if (i == 1) {
+                g.FillCircle(c.x, c.y, 21, hover == 1 ? Alpha(g.ink.accent, .85f) : g.ink.accent);
+                g.Icon(glyphs[i], RectF(c.x - 20, c.y - 20, c.x + 20 + (m.playing ? 0 : 1.5f), c.y + 20), 16, g.ink.onAccent);
+            } else {
+                if (hover == i && en[i]) g.FillCircle(c.x, c.y, 18, g.ink.hover);
+                g.Icon(glyphs[i], RectF(c.x - 18, c.y - 18, c.x + 18, c.y + 18), 15, en[i] ? g.ink.fg : g.ink.fg3);
+            }
+        }
+    }
+    int Hit(float x, float y) {
+        D2D1_SIZE_F bs = BaseSize(); Geo G = Lay(bs.width, bs.height);
+        for (int i = 0; i < 3; i++) { D2D1_POINT_2F c = Btn(G, i); float dx = x - c.x, dy = y - c.y; if (dx * dx + dy * dy <= 22 * 22) return i; }
+        return -1;
+    }
+    bool Click(float x, float y) override {
+        int h = Hit(x, y);
+        if (h == 0) g_media.Prev(); else if (h == 1) g_media.PlayPause(); else if (h == 2) g_media.Next();
+        return h >= 0;
+    }
+    bool Hover(float x, float y) override { int h = Hit(x, y); if (h == hover) return false; hover = h; return true; }
+    void Leave() override { hover = -1; }
+    void Options(std::vector<Opt>& o) override {
+        o.push_back({ Opt::Toggle, L"Show album art", L"", {}, [this] { return showArt ? 1 : 0; }, [this](int v) { showArt = v != 0; } });
+        o.push_back({ Opt::Toggle, L"Show progress bar", L"When the app reports the track position", {}, [this] { return showProgress ? 1 : 0; }, [this](int v) { showProgress = v != 0; } });
+    }
+    void Menu(HMENU m) override {
+        AddCheck(m, 101, L"Show album art", showArt);
+        AddCheck(m, 102, L"Show progress bar", showProgress);
+    }
+    void Command(int id) override { if (id == 101) showArt = !showArt; else if (id == 102) showProgress = !showProgress; }
+    void Load(const JVal& o) override { showArt = o.boolean(L"art", true); showProgress = o.boolean(L"progress", true); }
+    void Save(JVal& o) override { o.set(L"art") = JVal::MakeBool(showArt); o.set(L"progress") = JVal::MakeBool(showProgress); }
+};
+
 // ======================================================================= System
 class SystemWidget : public Widget {
 public:
     SystemWidget() { key = L"system"; title = L"System Monitor"; }
     std::wstring Description() override { return L"CPU, memory and battery (or disk) rings"; }
-    D2D1_SIZE_F BaseSize() override { return D2D1_SIZE_F{ 330, 150 }; }
+    D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ 330, 150 }; }
+    D2D1_SIZE_F MinSize() override { return D2D1_SIZE_F{ 170, 120 }; }
+    D2D1_SIZE_F MaxSize() override { return D2D1_SIZE_F{ 640, 440 }; }
     int Interval() override { return 2000; }
     void Draw(Gfx& g, float W, float H) override {
         g_sys.Update();
@@ -442,15 +650,31 @@ public:
             if (GetDiskFreeSpaceExW(L"C:\\", &fr, &tot, &tf) && tot.QuadPart) vals[2] = (float)(100.0 * (tot.QuadPart - tf.QuadPart) / tot.QuadPart);
             labels[2] = L"Disk C:"; swprintf(sub[2], 48, L"%.0f GB free", tf.QuadPart / 1073741824.0);
         }
-        float colW = (W - 24) / 3;
-        for (int i = 0; i < 3; i++) {
-            float cx = 12 + colW * (i + 0.5f), cy = 62, r = 34;
-            g.StrokeCircle(cx, cy, r, Alpha(g.ink.fg, 0.14f), 6);
-            g.Arc(cx, cy, r, 0, 360.f * Clamp(vals[i], 0.f, 100.f) / 100.f, g.ink.accent, 6);
-            wchar_t v[16]; swprintf(v, 16, L"%.0f%%", vals[i]);
-            g.Text(v, RectF(cx - r, cy - 14, cx + r, cy + 14), 16, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            g.Text(labels[i], RectF(cx - colW / 2, cy + r + 8, cx + colW / 2, cy + r + 26), 12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2, DWRITE_TEXT_ALIGNMENT_CENTER);
-            if (sub[i][0]) g.Text(sub[i], RectF(cx - colW / 2, cy + r + 25, cx + colW / 2, cy + r + 42), 11, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (W >= H * 1.5f) {   // rings in a row
+            float colW = (W - 24) / 3;
+            float r = std::max(16.f, std::min(colW / 2 - 12, (H - 72) / 2));
+            float sw = std::max(4.f, r * 0.17f), cy = (H - 44) / 2 + 6;
+            for (int i = 0; i < 3; i++) {
+                float cx = 12 + colW * (i + 0.5f);
+                g.StrokeCircle(cx, cy, r, Alpha(g.ink.fg, 0.14f), sw);
+                g.Arc(cx, cy, r, 0, 360.f * Clamp(vals[i], 0.f, 100.f) / 100.f, g.ink.accent, sw);
+                wchar_t v[16]; swprintf(v, 16, L"%.0f%%", vals[i]);
+                g.Text(v, RectF(cx - r, cy - r, cx + r, cy + r), std::max(11.f, r * 0.44f), DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                g.Text(labels[i], RectF(cx - colW / 2, cy + r + 8, cx + colW / 2, cy + r + 26), 12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2, DWRITE_TEXT_ALIGNMENT_CENTER);
+                if (sub[i][0] && cy + r + 42 <= H) g.Text(sub[i], RectF(cx - colW / 2, cy + r + 25, cx + colW / 2, cy + r + 42), 11, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
+        } else {               // list with bars
+            float rowH = (H - 24) / 3;
+            for (int i = 0; i < 3; i++) {
+                float y0 = 12 + i * rowH, by = y0 + rowH - 14;
+                wchar_t v[16]; swprintf(v, 16, L"%.0f%%", vals[i]);
+                g.Text(labels[i], RectF(18, y0, W - 70, by - 2), 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                if (sub[i][0] && W >= 240) g.Text(sub[i], RectF(18 + g.Measure(labels[i], 13, DWRITE_FONT_WEIGHT_SEMI_BOLD) + 8, y0, W - 70, by - 2), 11, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                g.Text(v, RectF(W - 80, y0, W - 18, by - 2), 14, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                g.FillRound(RectF(18, by, W - 18, by + 6), 3, Alpha(g.ink.fg, .14f));
+                float f = Clamp(vals[i], 0.f, 100.f) / 100.f;
+                if (f > 0) g.FillRound(RectF(18, by, 18 + std::max(6.f, (W - 36) * f), by + 6), 3, g.ink.accent);
+            }
         }
     }
 };
@@ -509,7 +733,7 @@ public:
             els.push_back(e);
         }
     }
-    D2D1_SIZE_F BaseSize() override { return D2D1_SIZE_F{ W, H }; }
+    D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ W, H }; }
     int Interval() override { return refresh <= 0 ? 3600000 : refresh; }
     D2D1_COLOR_F Col(Gfx& g, const std::wstring& s, D2D1_COLOR_F def) {
         if (s.empty()) return def;
@@ -616,6 +840,7 @@ public:
 std::unique_ptr<Widget> MakeClock() { return std::unique_ptr<Widget>(new ClockWidget()); }
 std::unique_ptr<Widget> MakeCalendar() { return std::unique_ptr<Widget>(new CalendarWidget()); }
 std::unique_ptr<Widget> MakeTodo() { return std::unique_ptr<Widget>(new TodoWidget()); }
+std::unique_ptr<Widget> MakeMedia() { return std::unique_ptr<Widget>(new MediaWidget()); }
 std::unique_ptr<Widget> MakeSystem() { return std::unique_ptr<Widget>(new SystemWidget()); }
 std::unique_ptr<Widget> MakeCustom(const std::wstring& f) { return std::unique_ptr<Widget>(new CustomWidget(f)); }
 

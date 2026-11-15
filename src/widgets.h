@@ -69,6 +69,11 @@ public:
     bool enabled = true;
     bool placed = false;    // has a saved position
     int x = 0, y = 0;       // panel top-left, physical screen px
+    // saved placement: corner of a monitor's work area + offset in DIPs (survives resolution/DPI/taskbar changes)
+    bool hasAnchor = false;
+    int anchor = 0;         // bit0 = right edge, bit1 = bottom edge
+    float adx = 0, ady = 0;
+    std::wstring mon;       // monitor device name, e.g. \\.\DISPLAY1
     float size = 1.0f;      // user size factor
     std::wstring theme;     // empty = global theme
 
@@ -81,7 +86,18 @@ public:
     ULONGLONG due = 0;
     bool dirty = true;
 
-    virtual D2D1_SIZE_F BaseSize() = 0;              // DIP at size 1.0
+    // Size model: content size in DIPs (resizable between Min and Max), then uniformly scaled by `size`.
+    float cw = 0, ch = 0;                             // user content size (0 = default)
+    virtual D2D1_SIZE_F DefaultSize() = 0;
+    virtual D2D1_SIZE_F MinSize() { return DefaultSize(); }
+    virtual D2D1_SIZE_F MaxSize() { return DefaultSize(); }
+    D2D1_SIZE_F BaseSize() {                          // current content size in DIPs
+        D2D1_SIZE_F d = DefaultSize(), mn = MinSize(), mx = MaxSize();
+        float w = cw > 0 ? cw : d.width, h = ch > 0 ? ch : d.height;
+        return D2D1_SIZE_F{ Clamp(w, mn.width, mx.width), Clamp(h, mn.height, mx.height) };
+    }
+    bool ResizableW() { return MaxSize().width > MinSize().width; }
+    bool ResizableH() { return MaxSize().height > MinSize().height; }
     virtual void Draw(Gfx& g, float W, float H) = 0;
     virtual int  Interval() { return 60000; }        // 1000 / 60000 = aligned to second / minute
     virtual bool Click(float, float) { return false; }
@@ -103,6 +119,7 @@ public:
 std::unique_ptr<Widget> MakeClock();
 std::unique_ptr<Widget> MakeCalendar();
 std::unique_ptr<Widget> MakeTodo();
+std::unique_ptr<Widget> MakeMedia();
 std::unique_ptr<Widget> MakeSystem();
 std::unique_ptr<Widget> MakeCustom(const std::wstring& file);
 void LoadTodos();
