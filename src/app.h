@@ -1,6 +1,14 @@
 #pragma once
 // Shared state + services between the widget host (app.cpp) and the Settings window (settings.cpp).
 #include "widgets.h"
+#include <functional>
+#include <climits>
+
+// Floating glass panel drawn with the same theme engine as widgets (used by popovers).
+struct GlassCache { std::vector<uint32_t> bg; float lum = .3f; int sx = INT_MIN, sy = 0, W = 0, H = 0; const void* theme = nullptr; };
+void RenderGlassPopup(HWND hwnd, GlassCache& c, const Theme& t, int panelX, int panelY, int pw, int ph, float s,
+                      const std::function<void(Gfx&, float W, float H)>& draw);
+int  GlassMargin(float s);
 
 struct AccentPreset { const wchar_t* name; const wchar_t* hex; };
 

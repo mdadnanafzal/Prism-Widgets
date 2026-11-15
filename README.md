@@ -114,6 +114,22 @@ Shows the **current weather** where you are (temperature, condition, today's hig
 
 * **Light on resources:** nothing runs until a Weather widget is shown. Each update is one small HTTPS request, about 6 KB, on a short-lived background thread. Updates pause during fullscreen games, and the widget only redraws every 5 minutes or when new data arrives.
 
+## Calendar events and holidays
+
+The Calendar widget can show **public holidays**, **your own events** and a **synced Google or Outlook calendar**. Turn it all on or off with **Show events & holidays** (right-click the calendar, or Settings → Calendar). Each source also has its own switch.
+
+* **On the month grid:** days with events get small dots, one per source (red for holidays, your accent colour for your own events, teal for the synced calendar). Holidays also turn the date red.
+* **Click any day** to open its details: every event that day, with time and source. From there you can **add an event**, or edit, delete or make yearly one of your own.
+  * Type `18:30 Dinner`, `6pm Gym` or just `Mom's birthday`. Events whose name includes "birthday" or "anniversary" repeat yearly automatically.
+* **Upcoming:** make the calendar taller (about 420 or more) and a list of the next events appears below the month.
+* **Compact size:** shows today's first event instead of the month name. Click it for the day's details.
+* **Public holidays:** taken from Google's public holiday calendars for about 50 countries. The country follows your Windows region; use **Holiday region → Change…** to pick another. Updated weekly and cached on disk.
+* **Google / Outlook sync (read-only):** paste your calendar's secret iCal (.ics) address into **Sync Google / Outlook calendar → Connect…**.
+  * Google Calendar: Settings → *your calendar* → **Secret address in iCal format**.
+  * Outlook.com: Settings → Calendar → Shared calendars → **Publish a calendar** → ICS link.
+  * Updated every 30 minutes. Recurring events, exceptions and cancelled events are handled. To disconnect, clear the address.
+* **Light on resources:** nothing is downloaded until a calendar with events is shown. Updates are one HTTPS request on a short-lived thread, and only the events from 2 months back to 13 months ahead are kept in memory.
+
 ## Media Controls widget
 
 The Media Controls widget shows **what's playing right now**: the album art, title, artist, which app it's playing in, and a progress bar. It has **previous, play/pause and next** buttons.
@@ -209,7 +225,7 @@ Custom widgets are JSON files in `%APPDATA%\PrismWidgets\widgets\`. To open that
 
 ## Where data is stored
 
-`%APPDATA%\PrismWidgets\` contains `config.json` (widgets, positions and themes), `todo.json` and `widgets\`. To reset everything, delete this folder while the app is closed.
+`%APPDATA%\PrismWidgets\` contains `config.json` (widgets, positions and themes), `todo.json`, `events.json` (your calendar events), cached holiday and calendar files (`holidays_XX.ics`, `calendar_sync.ics`) and `widgets\`. To reset everything, delete this folder while the app is closed.
 
 ## Build from source
 
@@ -232,6 +248,9 @@ Source layout:
 | `src/glass.cpp` | Wallpaper proxy and the software glass renderer (blur, refraction, rim light, shadow) |
 | `src/widgets.cpp` | Clock, Weather, Calendar, To-Do, Media Controls, System Monitor, custom JSON widgets and samples |
 | `src/weather.cpp` | Weather service: WinHTTP worker, Open-Meteo forecast, location detection and city search, disk cache |
+| `src/events.cpp` | Calendar events: holiday and iCal download, the .ics parser with recurrence rules, your own events |
+| `src/daypop.cpp` | The day details popover (add, edit, delete events) |
+| `src/net.cpp` | Small asynchronous HTTPS GET helper (WinHTTP) |
 | `src/media.cpp` | The Windows media session ("now playing"), accessed through the WinRT interfaces directly |
 | `src/util.cpp`, `src/json.cpp` | Helpers, variables and the JSON parser |
 

@@ -2,6 +2,8 @@
 #include "app.h"
 #include "media.h"
 #include "weather.h"
+#include "events.h"
+#include "net.h"
 #include <psapi.h>
 #include <algorithm>
 #include <shellscalingapi.h>
@@ -316,6 +318,55 @@ bool RenderPreview(Widget* w, const Theme& t, float scale, std::vector<uint32_t>
     return ok;
 }
 
+int GlassMargin(float s) { return (int)std::ceil(30 * s); }
+void RenderGlassPopup(HWND hwnd, GlassCache& c, const Theme& t, int px, int py, int pw, int ph, float s,
+                      const std::function<void(Gfx&, float, float)>& draw) {
+    if (!hwnd || !g_gr.EnsureTarget()) return;
+    int m = GlassMargin(s), W = pw + 2 * m, H = ph + 2 * m, sx = px - m, sy = py - m;
+    if (c.sx != sx || c.sy != sy || c.W != W || c.H != H || c.theme != &t || c.bg.size() != (size_t)W * H) {
+        c.bg.assign((size_t)W * H, 0);
+        g_wall.Ensure();
+        RenderBackground(t, sx, sy, W, H, m, s, Accent(), c.bg.data(), &c.lum);
+        ArmRelease();
+        c.sx = sx; c.sy = sy; c.W = W; c.H = H; c.theme = &t;
+    }
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    void* bits = nullptr;
+    HBITMAP dib = MakeDib(mem, W, H, &bits);
+    if (dib && bits) {
+        HGDIOBJ old = SelectObject(mem, dib);
+        RECT rc{ 0, 0, W, H };
+        if (SUCCEEDED(g_gr.rt->BindDC(mem, &rc))) {
+            float dpi = 96.f * s;
+            g_gr.rt->SetDpi(dpi, dpi);
+            g_gr.rt->BeginDraw();
+            D2D1_MATRIX_3X2_F tr; tr._11 = 1; tr._12 = 0; tr._21 = 0; tr._22 = 1; tr._31 = 0; tr._32 = 0;
+            g_gr.rt->SetTransform(&tr);
+            D2D1_COLOR_F clear{ 0, 0, 0, 0 }; g_gr.rt->Clear(&clear);
+            D2D1_BITMAP_PROPERTIES bp{ { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, dpi, dpi };
+            ID2D1Bitmap* bgb = nullptr;
+            if (SUCCEEDED(g_gr.rt->CreateBitmap(D2D1_SIZE_U{ (UINT32)W, (UINT32)H }, c.bg.data(), W * 4, &bp, &bgb))) {
+                g_gr.rt->DrawBitmap(bgb, nullptr, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
+                bgb->Release();
+            }
+            tr._31 = tr._32 = m / s;
+            g_gr.rt->SetTransform(&tr);
+            Gfx g{ g_gr.rt, g_gr.br, MakeInk(t, c.lum) };
+            draw(g, pw / s, ph / s);
+            if (g_gr.rt->EndDraw() == (HRESULT)D2DERR_RECREATE_TARGET) g_gr.DropTarget();
+            GdiFlush();
+        }
+        POINT dst{ sx, sy }, src{ 0, 0 }; SIZE sz{ W, H };
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        UpdateLayeredWindow(hwnd, screen, &dst, &sz, mem, &src, 0, &bf, ULW_ALPHA);
+        SelectObject(mem, old);
+    }
+    if (dib) DeleteObject(dib);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+}
+
 void RequestRedraw(Widget* w) { Render(w); }
 void Widget_RenderAll(bool invalidateBg) {
     for (auto& w : g_widgets) { if (invalidateBg) w->bgValid = false; Render(w.get()); }
@@ -394,6 +445,7 @@ static void SaveConfigNow() {
     c.set(L"pauseFullscreen") = JVal::MakeBool(g_pauseFullscreen);
     c.set(L"settingsTheme") = JVal::MakeStr(g_uiTheme);
     g_weather.SaveSettings(c.set(L"weather"));
+    g_events.SaveSettings(c.set(L"events"));
     JVal& arr = c.set(L"widgets"); arr = JVal::MakeArr();
     for (auto& w : g_widgets) {
         JVal e = JVal::MakeObj();
@@ -431,6 +483,7 @@ static void LoadConfig() {
     g_pauseFullscreen = g_cfg.boolean(L"pauseFullscreen", true);
     g_uiTheme = g_cfg.str(L"settingsTheme", L"system");
     g_weather.LoadSettings(g_cfg.get(L"weather"));
+    g_events.LoadSettings(g_cfg.get(L"events"));
 }
 
 // ------------------------------------------------------------------ placement
@@ -726,6 +779,7 @@ void ApplyWidget(Widget* w) {
 }
 // Posted (never synchronous): weather state can change while a widget is being drawn.
 void WeatherChanged() { PostMessageW(g_main, WM_APP + 7, 0, 0); }
+void EventsChanged() { PostMessageW(g_main, WM_APP + 10, 0, 0); }
 static void OnWeatherChanged() {
     for (auto& w : g_widgets) if (w->key == L"weather" && w->enabled && w->hwnd) Render(w.get());
     SettingsRefresh(true);
@@ -1180,6 +1234,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             if (!g_arranging && !g_drag.down && !OurWindowInFront()) { ReleaseCaches(); TrimMemory(); }
             else SetTimer(h, T_DEEPIDLE, 10 * 60 * 1000, nullptr);
             break;
+        case EVENTS_TIMER_ID: {
+            bool on = false; for (auto& w : g_widgets) if (w->key == L"calendar" && w->enabled) on = true;
+            if (on && !Paused()) g_events.Refresh(false);
+            break;
+        }
         case WEATHER_TIMER_ID: {
             KillTimer(h, WEATHER_TIMER_ID);
             bool on = false; for (auto& w : g_widgets) if (w->key == L"weather" && w->enabled) on = true;
@@ -1199,6 +1258,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_SHOWSETTINGS: OpenSettings(); return 0;
     case WM_STARTARRANGE: StartArrange(); return 0;
     case WM_WEATHER: g_weather.OnResult(wp, lp); return 0;
+    case WM_NET: NetDispatch(lp); return 0;
+    case WM_APP + 10: {   // events changed (posted; may originate inside Draw)
+        MSG dup; while (PeekMessageW(&dup, h, WM_APP + 10, WM_APP + 10, PM_REMOVE)) {}
+        for (auto& w : g_widgets) if (w->key == L"calendar" && w->enabled && w->hwnd) Render(w.get());
+        SettingsRefresh(true);
+        RefreshDayPopup();
+        return 0;
+    }
     case WM_APP + 7: { MSG dup; while (PeekMessageW(&dup, h, WM_APP + 7, WM_APP + 7, PM_REMOVE)) {} OnWeatherChanged(); return 0; }
     case WM_APP + 9: if (g_input.wnd && GetForegroundWindow() != g_input.wnd) CloseInput(true); return 0;
     case WM_SETTINGCHANGE:
@@ -1222,6 +1289,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         } else if (wp == PBT_APMRESUMEAUTOMATIC) { Widget_RenderAll(false); SetTimer(h, WEATHER_TIMER_ID, 15000, nullptr); }   // fresh weather after sleep
         return TRUE;
     case WM_DESTROY:
+        CloseDayPopup();
         EndArrange();
         CloseSettings();
         SaveConfigNow();

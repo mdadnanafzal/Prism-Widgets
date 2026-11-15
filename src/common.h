@@ -29,7 +29,7 @@
 
 #define APP_NAME     L"Prism Widgets"
 #define APP_ID       L"PrismWidgets"
-#define APP_VERSION  L"1.6.0"
+#define APP_VERSION  L"1.7.0"
 
 template <class T> inline void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 template <class T> inline T Clamp(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }

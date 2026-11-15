@@ -806,6 +806,8 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 
 } // namespace
 
+bool SettingsDarkMode() { return UiDark(); }
+
 void RegisterSettingsClass() {
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc = SettingsProc; wc.hInstance = g_inst; wc.lpszClassName = L"PrismSettings";

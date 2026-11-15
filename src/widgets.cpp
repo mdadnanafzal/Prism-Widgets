@@ -2,6 +2,7 @@
 #include "widgets.h"
 #include "media.h"
 #include "weather.h"
+#include "events.h"
 #include "app.h"
 #include <ctime>
 
@@ -253,8 +254,22 @@ public:
     CalendarWidget() { key = L"calendar"; title = L"Calendar"; }
     D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ 300, 300 }; }
     D2D1_SIZE_F MinSize() override { return D2D1_SIZE_F{ 150, 120 }; }
-    D2D1_SIZE_F MaxSize() override { return D2D1_SIZE_F{ 600, 600 }; }
+    D2D1_SIZE_F MaxSize() override { return D2D1_SIZE_F{ 600, 800 }; }
     static bool Compact(float W, float H) { return W < 236 || H < 228; }
+    // Height used by the month grid; when tall and events are on, the rest shows "Upcoming"
+    static float MonthH(float H) { return (g_events.enabled && H >= 420) ? std::min(H - 130, std::max(300.f, H * 0.58f)) : H; }
+    std::vector<int> upDays;   // days of the rows shown in "Upcoming" (for clicks)
+    int CellKey(int c) {
+        int y, m; View(y, m);
+        int lead = (Dow(y, m, 1) - FirstDay() + 7) % 7;
+        SYSTEMTIME s = FromIndex(DayIndex(y, m, 1) + c - lead);
+        return DayKey(s.wYear, s.wMonth, s.wDay);
+    }
+    void OpenDay(int day, float lx, float ly, float lw, float lh) {   // popover next to a local rect
+        float k = scale * size;
+        RECT a{ x + (LONG)(lx * k), y + (LONG)(ly * k), x + (LONG)((lx + lw) * k), y + (LONG)((ly + lh) * k) };
+        ShowDayPopup(day, a);
+    }
     static bool Weeks(float W) { return W >= 370; }
     struct GridGeo { float gx, cw, gy, ch; };
     static GridGeo Grid(float W, float H) {
@@ -281,7 +296,13 @@ public:
         float big = Clamp(std::min(H - 70, W * 0.6f), 30.f, 140.f);
         g.Text(std::to_wstring(now.wDay), RectF(14, 28, W - 10, 28 + big * 1.3f), big, DWRITE_FONT_WEIGHT_LIGHT, g.ink.fg,
                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, FONT_DISPLAY);
-        g.Text(FormatDateTime(now, W >= 190 ? L"MMMM yyyy" : L"MMM yyyy"), RectF(16, H - 36, W - 12, H - 14), 13.5f, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2);
+        std::vector<const Occ*> ev;
+        if (g_events.enabled) g_events.ForDay(TodayKey(), ev);
+        if (!ev.empty()) {   // today's first event instead of the month name
+            g.FillCircle(20, H - 25, 3.5f, EventColor(ev[0]->src, g.ink.accentText));
+            g.Text(ev[0]->title + (ev.size() > 1 ? L"  +" + std::to_wstring(ev.size() - 1) : L""), RectF(29, H - 36, W - 12, H - 14), 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg);
+        } else
+            g.Text(FormatDateTime(now, W >= 190 ? L"MMMM yyyy" : L"MMM yyyy"), RectF(16, H - 36, W - 12, H - 14), 13.5f, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2);
     }
     int FirstDay() { return firstDay < 0 ? LocaleFirstDayOfWeek() : firstDay; } // 0 = Monday
     static int DaysIn(int y, int m) { static const int d[] = { 31,28,31,30,31,30,31,31,30,31,30,31 }; return m == 2 && ((y % 4 == 0 && y % 100) || y % 400 == 0) ? 29 : d[m - 1]; }
@@ -296,7 +317,9 @@ public:
     D2D1_RECT_F Prev(float W) { return RectF(W - 76, 14, W - 46, 44); }
     D2D1_RECT_F Next(float W) { return RectF(W - 44, 14, W - 14, 44); }
     void Draw(Gfx& g, float W, float H) override {
+        if (g_events.enabled) g_events.Ensure();
         if (Compact(W, H)) { DrawCompact(g, W, H); return; }
+        float FH = H; H = MonthH(FH);
         SYSTEMTIME now; GetLocalTime(&now);
         int y, m; View(y, m);
         SYSTEMTIME first{}; first.wYear = (WORD)y; first.wMonth = (WORD)m; first.wDay = 1;
@@ -333,20 +356,64 @@ public:
             float x0 = gx + (c % 7) * cw, y0 = gy + (c / 7) * ch, ccx = x0 + cw / 2, ccy = y0 + ch / 2;
             bool today = cur && y == now.wYear && m == now.wMonth && day == now.wDay;
             float rr = std::min(cw, ch) / 2 - 2;
+            int mask = g_events.enabled ? g_events.Mask(CellKey(c)) : 0;
             if (today) g.FillCircle(ccx, ccy, rr, g.ink.accent);
+            else if (Pressed(10 + c)) g.FillCircle(ccx, ccy, rr, Alpha(g.ink.fg, .2f));
             else if (hoverPart == 10 + c) g.FillCircle(ccx, ccy, rr, g.ink.hover);
-            g.Text(std::to_wstring(shown), RectF(x0, y0, x0 + cw, y0 + ch), 13.5f,
-                   today ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
-                   today ? g.ink.onAccent : (cur ? g.ink.fg : g.ink.fg3),
+            D2D1_COLOR_F hol = EventColor(EV_HOLIDAY, g.ink.accentText);
+            D2D1_COLOR_F numCol = today ? g.ink.onAccent : (cur ? ((mask & 1) ? hol : g.ink.fg) : g.ink.fg3);
+            g.Text(std::to_wstring(shown), RectF(x0, y0, x0 + cw, y0 + ch - (mask ? 3 : 0)), 13.5f,
+                   today || (mask & 1) ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL, numCol,
                    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            if (mask) {   // one dot per source: holiday, mine, synced
+                int nd = ((mask & 1) != 0) + ((mask & 2) != 0) + ((mask & 4) != 0);
+                float dx = ccx - (nd - 1) * 2.75f, dy = ccy + std::min(rr * 0.68f, 11.f);
+                for (int sidx = 0; sidx < 3; sidx++) if (mask & (1 << sidx)) {
+                    D2D1_COLOR_F dc = today ? g.ink.onAccent : EventColor((unsigned char)sidx, g.ink.accentText);
+                    g.FillCircle(dx, dy, 1.9f, cur ? dc : Alpha(dc, .5f)); dx += 5.5f;
+                }
+            }
+        }
+        if (H < FH) DrawUpcoming(g, W, H, FH);
+    }
+    void DrawUpcoming(Gfx& g, float W, float top, float H) {
+        g.Line(16, top + 2, W - 16, top + 2, Alpha(g.ink.fg, .12f), 1);
+        g.Text(L"Upcoming", RectF(20, top + 10, W - 20, top + 32), 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2);
+        float y0 = top + 36, rowH = 30;
+        size_t n = (size_t)std::max(0.f, (H - y0 - 8) / rowH);
+        std::vector<const Occ*> up; g_events.Upcoming(TodayKey(), 60, n, up);
+        upDays.clear();
+        if (up.empty()) { g.Text(L"Nothing in the next 60 days", RectF(20, y0, W - 20, y0 + rowH), 13, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER); return; }
+        int today = TodayKey();
+        for (size_t i = 0; i < up.size(); i++) {
+            const Occ& o = *up[i];
+            float ry = y0 + i * rowH;
+            if (Pressed(200 + (int)i)) g.FillRound(RectF(10, ry + 1, W - 10, ry + rowH - 1), 8, Alpha(g.ink.fg, .17f));
+            else if (hoverPart == 200 + (int)i) g.FillRound(RectF(10, ry + 1, W - 10, ry + rowH - 1), 8, g.ink.hover);
+            g.FillCircle(24, ry + rowH / 2, 3.5f, EventColor(o.src, g.ink.accentText));
+            int yy, mm, dd; SplitDay(o.day, yy, mm, dd);
+            SYSTEMTIME st{}; st.wYear = (WORD)yy; st.wMonth = (WORD)mm; st.wDay = (WORD)dd;
+            std::wstring when = o.day == today ? L"Today" : o.day == AddDays(today, 1) ? L"Tomorrow" : FormatDateTime(st, L"ddd d MMM");
+            float dw = W >= 340 ? 96 : 76;
+            g.Text(when, RectF(34, ry, 34 + dw, ry + rowH), 12, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            wchar_t tm[16] = L""; if (o.sh >= 0) swprintf(tm, 16, L"%02d:%02d", o.sh, o.sm);
+            float tw = tm[0] ? 46 : 0;
+            g.Text(o.title, RectF(34 + dw, ry, W - 18 - tw, ry + rowH), 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            if (tm[0]) g.Text(tm, RectF(W - 18 - tw, ry, W - 18, ry + rowH), 12, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            upDays.push_back(o.day);
         }
     }
     int Part(float x, float y) {
-        float W = BaseSize().width, H = BaseSize().height;
-        if (Compact(W, H)) return -1;
+        float W = BaseSize().width, FH = BaseSize().height;
+        if (Compact(W, FH)) return (g_events.enabled && y < FH - 40) ? 300 : -1;   // compact card: open today
+        float H = MonthH(FH);
         if (In(Prev(W), x, y)) return 0;
         if (In(Next(W), x, y)) return 1;
         if (y >= 14 && y < 44 && x < W - 80) return 2;
+        if (H < FH && y >= H + 36) {   // Upcoming rows
+            int i = (int)((y - (H + 36)) / 30);
+            if (x >= 10 && x < W - 10 && i >= 0 && i < (int)upDays.size()) return 200 + i;
+        }
         GridGeo G = Grid(W, H);
         float gx = G.gx, cw = G.cw, gy = G.gy, ch = G.ch;
         if (x >= gx && x < W - 12 && y >= gy && y < H - 12) return 10 + (int)((y - gy) / ch) * 7 + (int)((x - gx) / cw);
@@ -357,24 +424,62 @@ public:
         if (p == 0) { offset--; return true; }
         if (p == 1) { offset++; return true; }
         if (p == 2 && offset) { offset = 0; return true; }
+        if (!g_events.enabled) return false;
+        D2D1_SIZE_F b = BaseSize();
+        if (p == 300) { OpenDay(TodayKey(), 0, 0, b.width, b.height); return false; }
+        if (p >= 200 && p < 300) { OpenDay(upDays[p - 200], 10, y - 15, b.width - 20, 30); return false; }
+        if (p >= 10 && p < 52) {
+            GridGeo G = Grid(b.width, MonthH(b.height));
+            int c = p - 10;
+            OpenDay(CellKey(c), G.gx + (c % 7) * G.cw, G.gy + (c / 7) * G.ch, G.cw, G.ch);
+            return false;
+        }
         return false;
     }
-    bool HitId(float x, float y, int& id) override { id = Part(x, y); return id == 0 || id == 1 || (id == 2 && offset != 0); }
+    bool HitId(float x, float y, int& id) override {
+        id = Part(x, y);
+        return id == 0 || id == 1 || (id == 2 && offset != 0) || (g_events.enabled && id >= 10 && id != 300);
+    }
     bool Wheel(float, float, int d) override { if (Compact(BaseSize().width, BaseSize().height)) return false; offset += d > 0 ? -1 : 1; return true; }
     bool Hover(float x, float y) override { int p = Part(x, y); if (p == hoverPart) return false; hoverPart = p; return true; }
     void Leave() override { hoverPart = -1; }
-    std::wstring Description() override { return L"Month view with today highlighted"; }
+    std::wstring Description() override { return L"Month view with events and holidays"; }
     void Options(std::vector<Opt>& o) override {
+        o.push_back({ Opt::Toggle, L"Show events & holidays", L"Dots on days with events; click a day for details", {},
+                      [] { return g_events.enabled ? 1 : 0; }, [](int v) { g_events.SetEnabled(v != 0); } });
+        if (g_events.enabled) {
+            o.push_back({ Opt::Toggle, L"Public holidays", g_events.HolidaySummary(), {}, [] { return g_events.holidays ? 1 : 0; }, [](int v) { g_events.SetHolidays(v != 0); } });
+            if (g_events.holidays)
+                o.push_back({ Opt::Action, L"Holiday region", g_events.region.empty() ? L"Automatic (" + g_events.RegionName() + L")" : g_events.RegionName(),
+                              { L"Change\u2026" }, nullptr, [](int) { g_events.ChooseRegion(); } });
+            o.push_back({ Opt::Toggle, L"My events", L"Click any day to add one. Birthdays and anniversaries repeat yearly.", {},
+                          [] { return g_events.mine ? 1 : 0; }, [](int v) { g_events.SetMine(v != 0); } });
+            o.push_back({ Opt::Action, L"Sync Google / Outlook calendar", g_events.SyncSummary(),
+                          { g_events.icsUrl.empty() ? L"Connect\u2026" : L"Change\u2026" }, nullptr, [](int) { g_events.AskIcsUrl(); } });
+            o.push_back({ Opt::Action, L"Update holidays & calendar now", L"Holidays refresh weekly, the synced calendar every 30 minutes",
+                          { L"Refresh" }, nullptr, [](int) { g_events.Refresh(true); } });
+        }
         o.push_back({ Opt::Choice, L"Week starts on", L"Automatic follows your Windows region settings", { L"Automatic", L"Monday", L"Sunday" },
                       [this] { return firstDay < 0 ? 0 : firstDay == 0 ? 1 : 2; }, [this](int v) { firstDay = v == 0 ? -1 : v == 1 ? 0 : 6; } });
         o.push_back({ Opt::Action, L"Go to today", L"", { L"Today" }, nullptr, [this](int) { offset = 0; } });
     }
     void Menu(HMENU m) override {
+        AddCheck(m, 110, L"Show events && holidays", g_events.enabled);
+        if (g_events.enabled) {
+            AppendMenuW(m, MF_STRING, 111, L"Today's events\u2026");
+            AppendMenuW(m, MF_STRING, 112, L"Update holidays && calendar");
+        }
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING | (offset == 0 ? MF_GRAYED : 0), 101, L"Go to today");
         AddCheck(m, 102, L"Week starts on Monday", FirstDay() == 0);
         AddCheck(m, 103, L"Week starts on Sunday", FirstDay() == 6);
     }
-    void Command(int id) override { if (id == 101) offset = 0; else if (id == 102) firstDay = 0; else if (id == 103) firstDay = 6; }
+    void Command(int id) override {
+        if (id == 101) offset = 0; else if (id == 102) firstDay = 0; else if (id == 103) firstDay = 6;
+        else if (id == 110) g_events.SetEnabled(!g_events.enabled);
+        else if (id == 111) { D2D1_SIZE_F b = BaseSize(); OpenDay(TodayKey(), 0, 0, b.width, b.height); }
+        else if (id == 112) g_events.Refresh(true);
+    }
     void Load(const JVal& o) override { firstDay = (int)o.num(L"firstDay", -1); }
     void Save(JVal& o) override { o.set(L"firstDay") = JVal::MakeNum(firstDay); }
 };
