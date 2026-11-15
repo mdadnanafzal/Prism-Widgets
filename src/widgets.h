@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include <functional>
+#include <unordered_map>
 
 // ------------------------------------------------------------ graphics
 struct Graphics {
@@ -15,9 +16,14 @@ struct Graphics {
     void DropTarget();
     IDWriteTextFormat* Format(const wchar_t* family, float size, DWRITE_FONT_WEIGHT w);
     void ClearFormats();
+    // B5: text layouts are cached, so unchanged labels aren't re-shaped on every redraw
+    IDWriteTextLayout* Layout(const std::wstring& s, IDWriteTextFormat* f, float w, float h, int align, int valign, bool wrap, bool strike);
+    void ClearLayouts();
 private:
-    struct Fmt { std::wstring fam; float size; int weight; IDWriteTextFormat* f; };
+    struct Fmt { std::wstring fam; float size; int weight; IDWriteTextFormat* f; IDWriteInlineObject* sign; };
     std::vector<Fmt> fmts_;
+    std::unordered_map<std::wstring, IDWriteTextLayout*> layouts_;
+    IDWriteInlineObject* SignFor(IDWriteTextFormat* f);
 };
 extern Graphics g_gr;
 
@@ -83,6 +89,7 @@ public:
     int bw = 0, bh = 0, margin = 0;
     float scale = 1.0f;     // monitor DPI / 96
     std::vector<uint32_t> bg; bool bgValid = false; float lum = 0.3f;
+    std::vector<uint32_t> content; bool contentValid = false; uint32_t contentKey = 0;   // A4: reused in Arrange mode
     ULONGLONG due = 0;
     bool dirty = true;
 
@@ -101,6 +108,10 @@ public:
     virtual void Draw(Gfx& g, float W, float H) = 0;
     virtual int  Interval() { return 60000; }        // 1000 / 60000 = aligned to second / minute
     virtual bool Click(float, float) { return false; }
+    // B3: instant press feedback. HitId says which pressable part is under a point.
+    virtual bool HitId(float, float, int&) { return false; }
+    bool isPressed = false; int pressed = 0;
+    bool Pressed(int id) const { return isPressed && pressed == id; }
     virtual bool RightClickAt(float, float, HMENU) { return false; } // add item-specific entries
     virtual bool Wheel(float, float, int) { return false; }
     virtual bool Hover(float, float) { return false; }
@@ -119,6 +130,7 @@ public:
 std::unique_ptr<Widget> MakeClock();
 std::unique_ptr<Widget> MakeCalendar();
 std::unique_ptr<Widget> MakeTodo();
+std::unique_ptr<Widget> MakeWeather();
 std::unique_ptr<Widget> MakeMedia();
 std::unique_ptr<Widget> MakeSystem();
 std::unique_ptr<Widget> MakeCustom(const std::wstring& file);

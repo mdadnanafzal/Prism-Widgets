@@ -608,6 +608,19 @@ float PagePerf(float x0, float x1, float y) {
         T(tiles[i].sub, R(r.left + 16, r.top + 86, r.right - 10, r.top + 106), 11.5f, DWRITE_FONT_WEIGHT_NORMAL, S.p.text3);
     }
     y += 118 + 22;
+    {   // C1: responsiveness numbers
+        wchar_t r1[64], r2[64], r3[64];
+        if (g_perf.renders) swprintf(r1, 64, L"%.1f ms avg \u00B7 %.0f ms max", g_perf.renderAvg, g_perf.renderMax); else wcscpy(r1, L"\u2014");
+        if (g_perf.clickLast >= 0) swprintf(r2, 64, L"%.0f ms last \u00B7 %.0f ms avg", g_perf.clickLast, g_perf.clickAvg); else wcscpy(r2, L"Click a widget button");
+        if (g_perf.dragRate > 0) swprintf(r3, 64, L"%.0f updates/s", g_perf.dragRate); else wcscpy(r3, L"Drag a widget in Arrange mode");
+        std::vector<RowSpec> live;
+        auto val = [](std::wstring v) { return [v](D2D1_RECT_F r) { T(v, r, 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, S.p.text, 2); }; };
+        live.push_back({ L"Redraw time", L"How long one widget takes to draw (max over the last minute)", val(r1) });
+        live.push_back({ L"Click response", L"From your click to the widget showing the result", val(r2) });
+        live.push_back({ L"Drag smoothness", L"Screen updates per second during the last drag or resize", val(r3) });
+        live.push_back({ L"Power mode", L"Full speed while you use widgets, efficiency mode a few seconds after", val(g_perf.responsive ? L"Responsive" : L"Efficiency") });
+        y = Group(x0, x1, y, L"Responsiveness", live);
+    }
     T(L"This Settings window adds a few MB while it is open. It is fully released when you close it; the widgets keep running.",
       R(x0 + 4, y, x1, y + 36), 12.5f, DWRITE_FONT_WEIGHT_NORMAL, S.p.text2, 0, false, true);
     y += 48;
@@ -615,7 +628,7 @@ float PagePerf(float x0, float x1, float y) {
     auto info = [](const wchar_t* v) { std::wstring s = v; return [s](D2D1_RECT_F r) { T(s, R(r.left, r.top, r.right, r.bottom), 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, S.p.text2, 2); }; };
     rows.push_back({ L"Rendering", L"CPU only (Direct2D software) \u2014 no GPU memory, redraws only when content changes", info(L"Software") });
     rows.push_back({ L"Wallpaper cache", L"Decoded only while needed, released after a few seconds idle", info(g_wall.Loaded() ? L"In use" : L"Released") });
-    rows.push_back({ L"Process priority", L"Below normal + Windows efficiency mode (EcoQoS)", info(L"Efficiency") });
+    rows.push_back({ L"Idle behaviour", L"Efficiency mode (EcoQoS) when idle; memory returned after 10 idle minutes", info(L"Automatic") });
     rows.push_back({ L"Free memory now", L"Drops caches and trims the working set", [](D2D1_RECT_F r) {
         Button(r.right, (r.top + r.bottom) / 2, L"Free now", false, [] { FreeMemoryNow(); }); } });
     y = Group(x0, x1, y, L"Efficiency", rows);
@@ -715,6 +728,7 @@ int HitTest(float x, float y) {
 }
 
 LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_MOUSEMOVE || m == WM_LBUTTONDOWN || m == WM_MOUSEWHEEL || m == WM_KEYDOWN || (m == WM_ACTIVATE && LOWORD(wp))) Interactive();
     switch (m) {
     case WM_PAINT: Paint(); return 0;
     case WM_ERASEBKGND: return 1;
@@ -783,7 +797,7 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (S.dib) { SelectObject(S.mem, S.old); DeleteObject(S.dib); }
         if (S.mem) DeleteDC(S.mem);
         S = State();
-        FreeMemoryNow();   // give everything back once the window is gone
+        ReleaseCaches();   // drop what this window built; the deep-idle trim returns memory later
         return 0;
     }
     }

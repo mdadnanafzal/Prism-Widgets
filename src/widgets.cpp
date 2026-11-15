@@ -1,6 +1,9 @@
 // Built-in widgets (clock, calendar, to-do, system) + JSON custom widgets.
 #include "widgets.h"
 #include "media.h"
+#include "weather.h"
+#include "app.h"
+#include <ctime>
 
 Graphics g_gr;
 
@@ -40,10 +43,36 @@ IDWriteTextFormat* Graphics::Format(const wchar_t* family, float size, DWRITE_FO
     if (FAILED(dw->CreateTextFormat(family, nullptr, w, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &tf)))
         return nullptr;
     if (fmts_.size() > 64) ClearFormats();
-    fmts_.push_back({ family, size, (int)w, tf });
+    fmts_.push_back({ family, size, (int)w, tf, nullptr });
     return tf;
 }
-void Graphics::ClearFormats() { for (auto& f : fmts_) SafeRelease(f.f); fmts_.clear(); }
+void Graphics::ClearFormats() {
+    ClearLayouts();
+    for (auto& f : fmts_) { SafeRelease(f.sign); SafeRelease(f.f); }
+    fmts_.clear();
+}
+IDWriteInlineObject* Graphics::SignFor(IDWriteTextFormat* f) {
+    for (auto& x : fmts_) if (x.f == f) { if (!x.sign) dw->CreateEllipsisTrimmingSign(f, &x.sign); return x.sign; }
+    return nullptr;
+}
+void Graphics::ClearLayouts() { for (auto& kv : layouts_) SafeRelease(kv.second); layouts_.clear(); }
+IDWriteTextLayout* Graphics::Layout(const std::wstring& s, IDWriteTextFormat* f, float w, float h, int align, int valign, bool wrap, bool strike) {
+    wchar_t pre[96];
+    swprintf(pre, 96, L"%p|%.1f|%.1f|%d%d%d%d|", (void*)f, w, h, align, valign, (int)wrap, (int)strike);
+    std::wstring key = pre + s;
+    auto it = layouts_.find(key);
+    if (it != layouts_.end()) return it->second;
+    if (layouts_.size() > 400) ClearLayouts();   // bounded: a few hundred small objects at most
+    IDWriteTextLayout* L = nullptr;
+    if (FAILED(dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), f, std::max(1.f, w), std::max(1.f, h), &L))) return nullptr;
+    L->SetTextAlignment((DWRITE_TEXT_ALIGNMENT)align);
+    L->SetParagraphAlignment((DWRITE_PARAGRAPH_ALIGNMENT)valign);
+    L->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+    if (!wrap) if (IDWriteInlineObject* sign = SignFor(f)) { DWRITE_TRIMMING tr{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 }; L->SetTrimming(&tr, sign); }
+    if (strike) { DWRITE_TEXT_RANGE rg{ 0, (UINT32)s.size() }; L->SetStrikethrough(TRUE, rg); }
+    layouts_.emplace(std::move(key), L);
+    return L;
+}
 
 // ======================================================================= Gfx
 void Gfx::Text(const std::wstring& s, D2D1_RECT_F r, float size, DWRITE_FONT_WEIGHT w, D2D1_COLOR_F c,
@@ -51,17 +80,8 @@ void Gfx::Text(const std::wstring& s, D2D1_RECT_F r, float size, DWRITE_FONT_WEI
     if (s.empty()) return;
     IDWriteTextFormat* f = g_gr.Format(family, size, w);
     if (!f) return;
-    IDWriteTextLayout* L = nullptr;
-    if (FAILED(g_gr.dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), f, std::max(1.f, r.right - r.left), std::max(1.f, r.bottom - r.top), &L))) return;
-    L->SetTextAlignment(a);
-    L->SetParagraphAlignment(v);
-    L->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
-    IDWriteInlineObject* sign = nullptr;
-    if (!wrap && SUCCEEDED(g_gr.dw->CreateEllipsisTrimmingSign(f, &sign))) {
-        DWRITE_TRIMMING tr{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
-        L->SetTrimming(&tr, sign);
-    }
-    if (strike) { DWRITE_TEXT_RANGE rg{ 0, (UINT32)s.size() }; L->SetStrikethrough(TRUE, rg); }
+    IDWriteTextLayout* L = g_gr.Layout(s, f, r.right - r.left, r.bottom - r.top, (int)a, (int)v, wrap, strike);
+    if (!L) return;
     if (ink.shadow) {
         const float offs[3][3] = { { 0, 1.5f, .30f }, { 0, .5f, .25f }, { 1, 1, .18f } };
         for (auto& o : offs) {
@@ -71,14 +91,12 @@ void Gfx::Text(const std::wstring& s, D2D1_RECT_F r, float size, DWRITE_FONT_WEI
     }
     br->SetColor(c);
     rt->DrawTextLayout(P(r.left, r.top), L, br);
-    SafeRelease(sign);
-    L->Release();
 }
 float Gfx::Measure(const std::wstring& s, float size, DWRITE_FONT_WEIGHT w, const wchar_t* family) {
     IDWriteTextFormat* f = g_gr.Format(family, size, w);
-    IDWriteTextLayout* L = nullptr;
-    if (!f || FAILED(g_gr.dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), f, 10000.f, 1000.f, &L))) return 0;
-    DWRITE_TEXT_METRICS m{}; L->GetMetrics(&m); L->Release();
+    IDWriteTextLayout* L = f ? g_gr.Layout(s, f, 10000.f, 1000.f, 0, 0, true, false) : nullptr;
+    if (!L) return 0;
+    DWRITE_TEXT_METRICS m{}; L->GetMetrics(&m);
     return m.widthIncludingTrailingWhitespace;
 }
 void Gfx::FillRound(D2D1_RECT_F r, float rad, D2D1_COLOR_F c) {
@@ -284,8 +302,10 @@ public:
         SYSTEMTIME first{}; first.wYear = (WORD)y; first.wMonth = (WORD)m; first.wDay = 1;
         g.Text(FormatDateTime(first, L"MMMM yyyy"), RectF(20, 16, W - 80, 44), 17, DWRITE_FONT_WEIGHT_SEMI_BOLD,
                offset == 0 ? g.ink.fg : g.ink.accentText);
-        if (hoverPart == 0) g.FillRound(Prev(W), 8, g.ink.hover);
-        if (hoverPart == 1) g.FillRound(Next(W), 8, g.ink.hover);
+        for (int b = 0; b < 2; b++) {
+            D2D1_RECT_F br = b ? Next(W) : Prev(W);
+            if (Pressed(b)) g.FillRound(br, 8, Alpha(g.ink.fg, .2f)); else if (hoverPart == b) g.FillRound(br, 8, g.ink.hover);
+        }
         g.Icon(0xE76B, Prev(W), 11, g.ink.fg2);
         g.Icon(0xE76C, Next(W), 11, g.ink.fg2);
         GridGeo G = Grid(W, H);
@@ -339,6 +359,7 @@ public:
         if (p == 2 && offset) { offset = 0; return true; }
         return false;
     }
+    bool HitId(float x, float y, int& id) override { id = Part(x, y); return id == 0 || id == 1 || (id == 2 && offset != 0); }
     bool Wheel(float, float, int d) override { if (Compact(BaseSize().width, BaseSize().height)) return false; offset += d > 0 ? -1 : 1; return true; }
     bool Hover(float x, float y) override { int p = Part(x, y); if (p == hoverPart) return false; hoverPart = p; return true; }
     void Leave() override { hoverPart = -1; }
@@ -402,7 +423,8 @@ public:
         for (int r = 0; r < rows && scroll + r < (int)vis.size(); r++) {
             int i = vis[scroll + r]; auto& t = g_todos[i];
             float y0 = top + r * rowH, cy = y0 + rowH / 2;
-            if (hover == scroll + r) g.FillRound(RectF(12, y0 + 1, W - 12, y0 + rowH - 1), 9, g.ink.hover);
+            if (Pressed(scroll + r)) g.FillRound(RectF(12, y0 + 1, W - 12, y0 + rowH - 1), 9, Alpha(g.ink.fg, .17f));
+            else if (hover == scroll + r) g.FillRound(RectF(12, y0 + 1, W - 12, y0 + rowH - 1), 9, g.ink.hover);
             if (t.done) { g.FillCircle(32, cy, 9, g.ink.accent); g.Icon(0xE73E, RectF(22, cy - 10, 42, cy + 10), 10, g.ink.onAccent); }
             else g.StrokeCircle(32, cy, 8.5f, g.ink.fg2, 1.5f);
             g.Text(t.text, RectF(52, y0, W - 22, y0 + rowH), 14, DWRITE_FONT_WEIGHT_NORMAL, t.done ? g.ink.fg3 : g.ink.fg,
@@ -414,7 +436,8 @@ public:
             g.FillRound(RectF(W - 9, ty, W - 6, ty + th), 1.5f, g.ink.fg3);
         }
         D2D1_RECT_F ar = AddRect();
-        if (hover == -2) g.FillRound(ar, 9, g.ink.hover);
+        if (Pressed(-2)) g.FillRound(ar, 9, Alpha(g.ink.fg, .17f));
+        else if (hover == -2) g.FillRound(ar, 9, g.ink.hover);
         g.Icon(0xE710, RectF(22, ar.top, 42, ar.bottom), 12, g.ink.accentText);
         g.Text(L"Add a task", RectF(52, ar.top, W - 20, ar.bottom), 14, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.accentText,
                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -428,6 +451,7 @@ public:
         int idx = scroll + r;
         return idx < (int)Visible().size() ? idx : -1;
     }
+    bool HitId(float x, float y, int& id) override { id = Hit(x, y); return id != -1; }
     int ItemAt(int hit) { auto v = Visible(); return hit >= 0 && hit < (int)v.size() ? v[hit] : -1; }
     bool Click(float x, float y) override {
         int h = Hit(x, y);
@@ -499,7 +523,7 @@ public:
     D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ 360, 156 }; }
     D2D1_SIZE_F MinSize() override { return D2D1_SIZE_F{ 200, 130 }; }
     D2D1_SIZE_F MaxSize() override { return D2D1_SIZE_F{ 620, 480 }; }
-    int Interval() override { return g_media.Busy() ? 250 : (g_media.st.playing ? 1000 : 2000); }
+    int Interval() override { return 60000; }   // redraws are driven by the media timer (app.cpp)
     std::wstring Description() override { return L"Now playing, with play/pause, next and previous"; }
     // Adaptive layout: 0 normal (art left), 1 narrow (small art), 2 tall album card (art on top)
     struct Geo { int mode; D2D1_RECT_F art; float x0, x1, yApp, yTitle, yArtist, titleSz, yProg, yBtn, gap, bx0, bx1; bool prog; };
@@ -540,8 +564,7 @@ public:
         return b;
     }
     void Draw(Gfx& g, float W, float H) override {
-        g_media.Pump();
-        const MediaState& m = g_media.st;
+        const MediaState& m = g_media.st;   // B4: polled by its own timer, never while drawing
         Geo G = Lay(W, H);
         if (showArt && G.art.right - G.art.left > 4) {
             D2D1_RECT_F ar = G.art;
@@ -573,7 +596,7 @@ public:
             }
         }
         float x0 = G.x0, x1 = G.x1;
-        std::wstring app = m.hasSession ? m.app : (m.available ? L"Media" : L"Media keys");
+        std::wstring app = m.hasSession ? m.app : (m.available || !m.checked ? L"Media" : L"Media keys");
         for (auto& c : app) c = towupper(c);
         g.Text(app, RectF(x0, G.yApp, x1 - 20, G.yApp + 16), 11, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg3);
         if (m.playing) {   // tiny equaliser glyph
@@ -597,10 +620,12 @@ public:
         for (int i = 0; i < 3; i++) {
             D2D1_POINT_2F c = Btn(G, i);
             if (i == 1) {
-                g.FillCircle(c.x, c.y, 21, hover == 1 ? Alpha(g.ink.accent, .85f) : g.ink.accent);
-                g.Icon(glyphs[i], RectF(c.x - 20, c.y - 20, c.x + 20 + (m.playing ? 0 : 1.5f), c.y + 20), 16, g.ink.onAccent);
+                bool pr = Pressed(1);
+                g.FillCircle(c.x, c.y, pr ? 19.f : 21.f, pr ? Alpha(g.ink.accent, .7f) : hover == 1 ? Alpha(g.ink.accent, .85f) : g.ink.accent);
+                g.Icon(glyphs[i], RectF(c.x - 20, c.y - 20, c.x + 20 + (m.playing ? 0 : 1.5f), c.y + 20), pr ? 15.f : 16.f, g.ink.onAccent);
             } else {
-                if (hover == i && en[i]) g.FillCircle(c.x, c.y, 18, g.ink.hover);
+                if (Pressed(i) && en[i]) g.FillCircle(c.x, c.y, 17, Alpha(g.ink.fg, .2f));
+                else if (hover == i && en[i]) g.FillCircle(c.x, c.y, 18, g.ink.hover);
                 g.Icon(glyphs[i], RectF(c.x - 18, c.y - 18, c.x + 18, c.y + 18), 15, en[i] ? g.ink.fg : g.ink.fg3);
             }
         }
@@ -613,8 +638,10 @@ public:
     bool Click(float x, float y) override {
         int h = Hit(x, y);
         if (h == 0) g_media.Prev(); else if (h == 1) g_media.PlayPause(); else if (h == 2) g_media.Next();
+        if (h >= 0) MediaKick();   // icon already flipped; confirm the real state shortly
         return h >= 0;
     }
+    bool HitId(float x, float y, int& id) override { id = Hit(x, y); return id >= 0; }
     bool Hover(float x, float y) override { int h = Hit(x, y); if (h == hover) return false; hover = h; return true; }
     void Leave() override { hover = -1; }
     void Options(std::vector<Opt>& o) override {
@@ -628,6 +655,239 @@ public:
     void Command(int id) override { if (id == 101) showArt = !showArt; else if (id == 102) showProgress = !showProgress; }
     void Load(const JVal& o) override { showArt = o.boolean(L"art", true); showProgress = o.boolean(L"progress", true); }
     void Save(JVal& o) override { o.set(L"art") = JVal::MakeBool(showArt); o.set(L"progress") = JVal::MakeBool(showProgress); }
+};
+
+// ======================================================================= Weather
+// Vector weather icons (drawn with Direct2D, coloured, no icon font needed)
+namespace wx {
+D2D1_COLOR_F C(float r, float g, float b, float a = 1) { return D2D1_COLOR_F{ r, g, b, a }; }
+void Sun(Gfx& g, float cx, float cy, float r) {
+    D2D1_COLOR_F sun = C(1.f, .76f, .18f);
+    for (int i = 0; i < 8; i++) {
+        float a = i * 3.14159265f / 4, c = std::cos(a), s = std::sin(a);
+        g.Line(cx + c * r * 1.35f, cy + s * r * 1.35f, cx + c * r * 1.75f, cy + s * r * 1.75f, sun, std::max(1.2f, r * 0.2f));
+    }
+    g.FillCircle(cx, cy, r, sun);
+    g.FillCircle(cx - r * .25f, cy - r * .25f, r * .45f, C(1, .88f, .45f, .55f));
+}
+void Moon(Gfx& g, float cx, float cy, float r) {
+    ID2D1EllipseGeometry *a = nullptr, *b = nullptr; ID2D1PathGeometry* p = nullptr; ID2D1GeometrySink* sk = nullptr;
+    D2D1_ELLIPSE ea{ D2D1_POINT_2F{ cx, cy }, r, r }, eb{ D2D1_POINT_2F{ cx + r * .55f, cy - r * .45f }, r * .85f, r * .85f };
+    if (SUCCEEDED(g_gr.d2d->CreateEllipseGeometry(&ea, &a)) && SUCCEEDED(g_gr.d2d->CreateEllipseGeometry(&eb, &b)) &&
+        SUCCEEDED(g_gr.d2d->CreatePathGeometry(&p)) && SUCCEEDED(p->Open(&sk))) {
+        a->CombineWithGeometry(b, D2D1_COMBINE_MODE_EXCLUDE, nullptr, 0.25f, sk);
+        sk->Close();
+        g.br->SetColor(C(.97f, .93f, .74f));
+        g.rt->FillGeometry(p, g.br, nullptr);
+    }
+    SafeRelease(sk); SafeRelease(p); SafeRelease(b); SafeRelease(a);
+}
+void Cloud(Gfx& g, float cx, float cy, float s, D2D1_COLOR_F col) {
+    // soft shadow first so white clouds stay visible on light glass
+    for (int pass = 0; pass < 2; pass++) {
+        D2D1_COLOR_F c = pass == 0 ? C(0, 0, 0, .13f) : col;
+        float oy = pass == 0 ? s * .04f : 0;
+        g.FillCircle(cx - s * .22f, cy + s * .05f + oy, s * .2f, c);
+        g.FillCircle(cx + s * .02f, cy - s * .08f + oy, s * .28f, c);
+        g.FillCircle(cx + s * .26f, cy + s * .07f + oy, s * .18f, c);
+        g.FillRound(RectF(cx - s * .42f, cy + s * .03f + oy, cx + s * .44f, cy + s * .25f + oy), s * .11f, c);
+    }
+}
+// size = icon box edge in DIP
+void Icon(Gfx& g, int code, bool day, float cx, float cy, float size) {
+    float s = size;
+    D2D1_COLOR_F white = C(.97f, .98f, 1.f), grey = C(.80f, .83f, .88f), dark = C(.58f, .62f, .69f), drop = C(.35f, .66f, 1.f);
+    auto body = [&](float ox, float oy, float k) { if (day) Sun(g, cx + ox * s, cy + oy * s, s * .17f * k); else Moon(g, cx + ox * s, cy + oy * s, s * .2f * k); };
+    if (code == 0) { body(0, 0, 1.25f); return; }
+    if (code == 1 || code == 2) {
+        body(-.16f, -.15f, code == 1 ? 1.1f : 1.f);
+        Cloud(g, cx + s * .1f, cy + s * .08f, s * (code == 1 ? .62f : .8f), white);
+        return;
+    }
+    if (code == 3) { Cloud(g, cx - s * .14f, cy - s * .12f, s * .62f, grey); Cloud(g, cx + s * .06f, cy + s * .02f, s * .9f, white); return; }
+    if (code == 45 || code == 48) {
+        Cloud(g, cx, cy - s * .14f, s * .78f, grey);
+        for (int i = 0; i < 2; i++) g.Line(cx - s * .36f + i * s * .1f, cy + s * (.22f + i * .12f), cx + s * .36f + i * s * .02f, cy + s * (.22f + i * .12f), grey, s * .05f);
+        return;
+    }
+    bool snow = (code >= 71 && code <= 77) || code == 85 || code == 86;
+    bool thunder = code >= 95;
+    bool drizzle = code >= 51 && code <= 57;
+    Cloud(g, cx, cy - s * .14f, s * .88f, thunder ? dark : (code >= 63 && !snow) ? grey : white);
+    if (thunder) {
+        ID2D1PathGeometry* p = nullptr; ID2D1GeometrySink* sk = nullptr;
+        if (SUCCEEDED(g_gr.d2d->CreatePathGeometry(&p)) && SUCCEEDED(p->Open(&sk))) {
+            D2D1_POINT_2F pts[] = { { cx + s * .02f, cy + s * .12f }, { cx - s * .12f, cy + s * .3f }, { cx - s * .01f, cy + s * .3f },
+                                    { cx - s * .08f, cy + s * .46f }, { cx + s * .12f, cy + s * .24f }, { cx + s * .01f, cy + s * .24f } };
+            sk->BeginFigure(D2D1_POINT_2F{ cx + s * .08f, cy + s * .12f }, D2D1_FIGURE_BEGIN_FILLED);
+            sk->AddLines(pts, 6); sk->EndFigure(D2D1_FIGURE_END_CLOSED); sk->Close();
+            g.br->SetColor(C(1.f, .80f, .2f)); g.rt->FillGeometry(p, g.br, nullptr);
+        }
+        SafeRelease(sk); SafeRelease(p);
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        float x = cx - s * .2f + i * s * .2f, y = cy + s * .2f;
+        if (snow) { g.FillCircle(x, y + s * .06f + (i % 2) * s * .07f, s * .045f, white); g.FillCircle(x, y + s * .06f + (i % 2) * s * .07f, s * .025f, C(.75f, .85f, 1.f)); }
+        else if (drizzle) g.FillCircle(x, y + s * .06f + (i % 2) * s * .06f, s * .03f, drop);
+        else g.Line(x + s * .03f, y + s * .02f, x - s * .04f, y + s * .18f, drop, s * .055f);
+    }
+}
+SYSTEMTIME LocalOf(long long unix, int offset) {
+    ULONGLONG v = (ULONGLONG)(unix + offset) * 10000000ULL + 116444736000000000ULL;
+    FILETIME f{ (DWORD)v, (DWORD)(v >> 32) }; SYSTEMTIME st; FileTimeToSystemTime(&f, &st); return st;
+}
+std::wstring Deg(float t) { wchar_t b[16]; swprintf(b, 16, L"%.0f°", std::round(t) == 0 ? 0.f : t); return b; }
+}
+
+class WeatherWidget : public Widget {
+public:
+    WeatherWidget() { key = L"weather"; title = L"Weather"; }
+    D2D1_SIZE_F DefaultSize() override { return D2D1_SIZE_F{ 320, 160 }; }
+    D2D1_SIZE_F MinSize() override { return D2D1_SIZE_F{ 160, 110 }; }
+    D2D1_SIZE_F MaxSize() override { return D2D1_SIZE_F{ 680, 680 }; }
+    int Interval() override { return 300000; }
+    std::wstring Description() override { return g_weather.place.empty() ? L"Current weather, hourly and 7-day forecast" : L"Forecast for " + g_weather.place; }
+
+    void DrawHourly(Gfx& g, const WeatherData& d, D2D1_RECT_F r) {
+        long long now = (long long)time(nullptr);
+        std::vector<const WeatherHour*> hs;
+        for (auto& h : d.hours) if (h.t + 3600 > now) hs.push_back(&h);
+        float colMin = 54;
+        int n = std::min((int)hs.size(), std::max(1, (int)((r.right - r.left) / colMin)));
+        if (n <= 0) return;
+        float cw = (r.right - r.left) / n, H = r.bottom - r.top;
+        bool t24 = LocaleUses24h();
+        for (int i = 0; i < n; i++) {
+            const WeatherHour& h = *hs[i];
+            float x0 = r.left + i * cw;
+            std::wstring lbl;
+            if (i == 0) lbl = L"Now";
+            else { SYSTEMTIME st = wx::LocalOf(h.t, d.utcOffset); lbl = FormatDateTime(st, t24 ? L"HH:mm" : L"h tt"); }
+            g.Text(lbl, RectF(x0, r.top, x0 + cw, r.top + 18), 11.5f, i == 0 ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2, DWRITE_TEXT_ALIGNMENT_CENTER);
+            float isz = std::min(26.f, H - 46);
+            wx::Icon(g, h.code, h.day, x0 + cw / 2, r.top + 19 + isz / 2, isz);
+            g.Text(wx::Deg(h.temp), RectF(x0, r.bottom - 20, x0 + cw, r.bottom), 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg, DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (h.pop >= 30) g.Text(std::to_wstring(h.pop) + L"%", RectF(x0, r.top + 17 + isz, x0 + cw, r.top + 30 + isz), 10, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                    D2D1_COLOR_F{ .35f, .66f, 1.f, 1 }, DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+    }
+    void DrawDaily(Gfx& g, const WeatherData& d, D2D1_RECT_F r) {
+        float rowH = 34;
+        int n = std::min((int)d.days.size(), (int)((r.bottom - r.top) / rowH));
+        if (n <= 0) return;
+        float lo = 1e9f, hi = -1e9f;
+        for (int i = 0; i < n; i++) { lo = std::min(lo, d.days[i].tmin); hi = std::max(hi, d.days[i].tmax); }
+        float W = r.right - r.left;
+        float xIcon = r.left + 70, xLo = r.left + 112, xBar0 = r.left + 150, xBar1 = r.right - 42;
+        bool showPop = W >= 300;
+        if (showPop) xLo += 30, xBar0 += 30;
+        for (int i = 0; i < n; i++) {
+            const WeatherDay& dd = d.days[i];
+            float y0 = r.top + i * rowH, cy = y0 + rowH / 2;
+            std::wstring nm = i == 0 ? L"Today" : FormatDateTime(wx::LocalOf(dd.t + 12 * 3600, d.utcOffset), L"ddd");
+            g.Text(nm, RectF(r.left, y0, xIcon - 14, y0 + rowH), 13.5f, i == 0 ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg,
+                   DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            wx::Icon(g, dd.code, true, xIcon, cy, 24);
+            if (showPop && dd.pop >= 20) g.Text(std::to_wstring(dd.pop) + L"%", RectF(xIcon + 14, y0, xLo - 2, y0 + rowH), 11, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                                  D2D1_COLOR_F{ .35f, .66f, 1.f, 1 }, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            g.Text(wx::Deg(dd.tmin), RectF(xLo, y0, xBar0 - 8, y0 + rowH), 13, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            // temperature range bar, positioned on the week's overall range
+            g.FillRound(RectF(xBar0, cy - 2.5f, xBar1, cy + 2.5f), 2.5f, Alpha(g.ink.fg, .14f));
+            float span = std::max(1.f, hi - lo);
+            float a = xBar0 + (xBar1 - xBar0) * (dd.tmin - lo) / span, b = xBar0 + (xBar1 - xBar0) * (dd.tmax - lo) / span;
+            g.FillRound(RectF(a, cy - 2.5f, std::max(a + 5, b), cy + 2.5f), 2.5f, g.ink.accent);
+            g.Text(wx::Deg(dd.tmax), RectF(xBar1 + 6, y0, r.right, y0 + rowH), 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+    }
+    void Draw(Gfx& g, float W, float H) override {
+        g_weather.Ensure();
+        const WeatherData& d = g_weather.data;
+        std::wstring place = g_weather.place.empty() ? L"Weather" : g_weather.place;
+        if (!d.valid) {   // loading / problem states
+            wx::Icon(g, 3, true, 52, H / 2, 64);
+            g.Text(place, RectF(100, H / 2 - 30, W - 14, H / 2 - 8), 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2);
+            g.Text(g_weather.status.empty() ? L"Getting the weather…" : g_weather.status, RectF(100, H / 2 - 8, W - 14, H / 2 + 34), 13, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg,
+                   DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, FONT_TEXT, false, true);
+            return;
+        }
+        float hi = d.days.empty() ? d.temp : d.days[0].tmax, lo = d.days.empty() ? d.temp : d.days[0].tmin;
+        wchar_t hl[48]; swprintf(hl, 48, L"H:%ls  L:%ls", wx::Deg(hi).c_str(), wx::Deg(lo).c_str());
+
+        if (W < 230 || H < 140) {   // ---- compact
+            float isz = std::min(H * 0.42f, W * 0.34f);
+            wx::Icon(g, d.code, d.day, W - 12 - isz / 2, 12 + isz / 2, isz);
+            g.Text(place, RectF(14, 10, W - isz - 16, 28), 12, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2);
+            float big = std::min(H * 0.34f, 46.f);
+            g.Text(wx::Deg(d.temp), RectF(12, 26, W, 26 + big * 1.3f), big, DWRITE_FONT_WEIGHT_LIGHT, g.ink.fg, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, FONT_DISPLAY);
+            g.Text(WeatherText(d.code), RectF(14, H - 40, W - 10, H - 24), 12, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg);
+            g.Text(hl, RectF(14, H - 24, W - 10, H - 8), 11.5f, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2);
+            return;
+        }
+        // ---- current conditions block (left), icon (right)
+        bool side = W >= 560 && H < 250;                  // wide & short: hourly goes to the right
+        float cbw = side ? std::min(330.f, W * 0.48f) : W;
+        float cbh = std::min(H, 168.f);
+        float isz = std::min(cbh * 0.56f, std::min(104.f, cbw * 0.3f));
+        wx::Icon(g, d.code, d.day, cbw - 20 - isz / 2, 16 + isz / 2 + 4, isz);
+        g.Icon(0xE81D, RectF(16, 12, 32, 32), 11, g.ink.fg2);
+        g.Text(place, RectF(34, 12, cbw - isz - 24, 32), 13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg2, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        float big = std::min(58.f, cbh * 0.36f);
+        g.Text(wx::Deg(d.temp), RectF(14, 30, cbw - isz - 20, 30 + big * 1.3f), big, DWRITE_FONT_WEIGHT_LIGHT, g.ink.fg, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, FONT_DISPLAY);
+        float ty = 30 + big * 1.22f;
+        g.Text(WeatherText(d.code), RectF(18, ty, cbw - 14, ty + 20), 14, DWRITE_FONT_WEIGHT_SEMI_BOLD, g.ink.fg);
+        g.Text(hl, RectF(18, ty + 20, cbw - 14, ty + 38), 12.5f, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg2);
+        if (cbh >= 160 && cbw >= 300) {
+            wchar_t ex[96];
+            swprintf(ex, 96, L"Feels %ls · Humidity %d%% · Wind %.0f %ls", wx::Deg(d.feels).c_str(), d.humidity, d.wind, d.fahrenheit ? L"mph" : L"km/h");
+            g.Text(ex, RectF(18, ty + 38, cbw - 14, ty + 56), 11.5f, DWRITE_FONT_WEIGHT_NORMAL, g.ink.fg3);
+        }
+        if (side) {
+            g.Line(cbw, 18, cbw, H - 18, Alpha(g.ink.fg, .12f), 1);
+            DrawHourly(g, d, RectF(cbw + 8, (H - 92) / 2, W - 12, (H + 92) / 2));
+            return;
+        }
+        float y = cbh;
+        if (H - y >= 92) {   // ---- hourly strip
+            g.Line(16, y - 2, W - 16, y - 2, Alpha(g.ink.fg, .12f), 1);
+            DrawHourly(g, d, RectF(12, y + 6, W - 12, y + 84));
+            y += 92;
+        }
+        if (H - y >= 3 * 34 + 10) {   // ---- daily list
+            g.Line(16, y - 2, W - 16, y - 2, Alpha(g.ink.fg, .12f), 1);
+            DrawDaily(g, d, RectF(18, y + 4, W - 18, H - 8));
+        }
+    }
+    bool Click(float, float) override {
+        if (!g_weather.data.valid && !g_weather.haveLoc) { g_weather.AskCity(); return false; }   // no location yet: search a city
+        if (!g_weather.data.valid) { g_weather.Refresh(true); return true; }
+        return false;
+    }
+    void Options(std::vector<Opt>& o) override {
+        o.push_back({ Opt::Action, L"Location", (g_weather.place.empty() ? std::wstring(L"Not set") : g_weather.place) + (g_weather.autoLoc ? L" · detected automatically" : L""),
+                      { L"Change…" }, nullptr, [](int) { g_weather.AskCity(); } });
+        o.push_back({ Opt::Toggle, L"Detect location automatically", L"Approximate, based on your internet connection", {},
+                      [] { return g_weather.autoLoc ? 1 : 0; }, [](int v) { g_weather.SetAuto(v != 0); } });
+        o.push_back({ Opt::Choice, L"Units", L"", { L"Automatic", L"°C", L"°F" },
+                      [] { return g_weather.units + 1; }, [](int v) { g_weather.SetUnits(v - 1); } });
+        o.push_back({ Opt::Action, L"Updates every 30 minutes", g_weather.busy ? L"Updating…" : (g_weather.status.empty() ? g_weather.UpdatedText() : g_weather.status),
+                      { L"Refresh" }, nullptr, [](int) { g_weather.Refresh(true); } });
+    }
+    void Menu(HMENU m) override {
+        AppendMenuW(m, MF_STRING, 101, L"Refresh now");
+        AppendMenuW(m, MF_STRING, 102, L"Change location…");
+        AddCheck(m, 103, L"Detect location automatically", g_weather.autoLoc);
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AddCheck(m, 104, L"Celsius (°C)", !g_weather.Fahrenheit());
+        AddCheck(m, 105, L"Fahrenheit (°F)", g_weather.Fahrenheit());
+    }
+    void Command(int id) override {
+        if (id == 101) g_weather.Refresh(true);
+        else if (id == 102) g_weather.AskCity();
+        else if (id == 103) g_weather.SetAuto(!g_weather.autoLoc);
+        else if (id == 104) g_weather.SetUnits(0);
+        else if (id == 105) g_weather.SetUnits(1);
+    }
 };
 
 // ======================================================================= System
@@ -799,7 +1059,7 @@ public:
                 g.Arc(e.x, e.y, e.r, 0, 360 * frac, Col(g, e.color == L"fg" ? L"accent" : e.color, g.ink.accent), e.thick);
             } else if (e.type == L"button") {
                 D2D1_COLOR_F f = Col(g, e.fill, Alpha(g.ink.fg, .10f));
-                if (hoverEl == i) f = Alpha(f, 1.8f);
+                if (Pressed(i)) f = Alpha(f, 2.8f); else if (hoverEl == i) f = Alpha(f, 1.8f);
                 g.FillRound(b, e.radius, f);
                 if (e.glyph) {
                     float gs = e.size * 1.15f;
@@ -820,6 +1080,7 @@ public:
         return -1;
     }
     bool Click(float x, float y) override { int i = HitEl(x, y); if (i < 0) return false; Launch(ExpandVars(els[i].click)); return false; }
+    bool HitId(float x, float y, int& id) override { id = HitEl(x, y); return id >= 0; }
     bool Hover(float x, float y) override { int i = HitEl(x, y); if (i == hoverEl) return false; hoverEl = i; return true; }
     void Leave() override { hoverEl = -1; }
     std::wstring Description() override { return error.empty() ? L"Custom widget \u00B7 " + file : L"Error: " + error; }
@@ -840,6 +1101,7 @@ public:
 std::unique_ptr<Widget> MakeClock() { return std::unique_ptr<Widget>(new ClockWidget()); }
 std::unique_ptr<Widget> MakeCalendar() { return std::unique_ptr<Widget>(new CalendarWidget()); }
 std::unique_ptr<Widget> MakeTodo() { return std::unique_ptr<Widget>(new TodoWidget()); }
+std::unique_ptr<Widget> MakeWeather() { return std::unique_ptr<Widget>(new WeatherWidget()); }
 std::unique_ptr<Widget> MakeMedia() { return std::unique_ptr<Widget>(new MediaWidget()); }
 std::unique_ptr<Widget> MakeSystem() { return std::unique_ptr<Widget>(new SystemWidget()); }
 std::unique_ptr<Widget> MakeCustom(const std::wstring& f) { return std::unique_ptr<Widget>(new CustomWidget(f)); }

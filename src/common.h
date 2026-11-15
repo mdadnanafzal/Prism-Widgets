@@ -25,10 +25,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 
 #define APP_NAME     L"Prism Widgets"
 #define APP_ID       L"PrismWidgets"
-#define APP_VERSION  L"1.4.0"
+#define APP_VERSION  L"1.6.0"
 
 template <class T> inline void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 template <class T> inline T Clamp(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -118,6 +119,10 @@ public:
     void Release();
     bool Loaded() const { return loaded_; }
     const std::vector<Mon>& Mons() const { return mons_; }
+    float PhysPerProxy(int mon) const {   // physical screen px per proxy px (>= 1 on big screens)
+        if (mon < 0 || mon >= (int)mons_.size() || !mons_[mon].pw) return 1.f;
+        return (float)(mons_[mon].rc.right - mons_[mon].rc.left) / mons_[mon].pw;
+    }
     // Bilinear sample (physical screen coords). Returns 0x00RRGGBB.
     void Sample(int mon, float x, float y, float& r, float& g, float& b) const;
     int  MonitorFor(const RECT& r) const;

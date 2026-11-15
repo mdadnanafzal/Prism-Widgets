@@ -201,6 +201,7 @@ bool Media::Pump() {
             }
             WindowsDeleteString(h);
         }
+        if (!mgrOp_) st.checked = true;
     }
     // never let a stuck async call keep us polling fast
     if (Busy()) {
@@ -214,8 +215,8 @@ bool Media::Pump() {
     } else busySince_ = 0;
     if (mgrOp_) {
         int s = Status(mgrOp_);
-        if (s == 1) { VCall(mgrOp_, ASYNCOP_GetResults, &manager_); Rel(mgrOp_); lastPoll_ = 0; changed = true; }
-        else if (s > 1) { Rel(mgrOp_); st.available = false; changed = true; }
+        if (s == 1) { VCall(mgrOp_, ASYNCOP_GetResults, &manager_); Rel(mgrOp_); lastPoll_ = 0; changed = true; st.checked = true; }
+        else if (s > 1) { Rel(mgrOp_); st.available = false; changed = true; st.checked = true; }
     }
     for (size_t i = 0; i < cmdOps_.size();) {
         if (Status(cmdOps_[i]) != 0) { Rel(cmdOps_[i]); cmdOps_.erase(cmdOps_.begin() + i); lastPoll_ = 0; }

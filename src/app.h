@@ -36,6 +36,23 @@ void OpenDataFolder();
 // Renders a widget (desktop look, real wallpaper) into premultiplied BGRA pixels for previews.
 bool RenderPreview(Widget* w, const Theme& t, float scale, std::vector<uint32_t>& px, int& W, int& H);
 
+// Live performance numbers (Settings -> Performance)
+struct PerfStats {
+    double renderLast = 0, renderAvg = 0, renderMax = 0; ULONGLONG maxAt = 0; unsigned renders = 0;
+    double clickLast = -1, clickAvg = -1;       // input -> screen updated, ms
+    double dragRate = 0;                        // screen updates per second during the last drag / resize
+    bool responsive = false;                    // full speed (true) or efficiency mode (false)
+};
+extern PerfStats g_perf;
+void Interactive();                             // user is interacting: run at full speed for a few seconds
+void PerfDragBegin();
+void PerfDragStep();
+void PerfDragEnd();
+void PerfClick(DWORD msgTime, LONGLONG qpcStart);
+void MoveWidgetFast(Widget* w);                 // slide the window; glass is refreshed when the mouse rests
+void ReleaseCaches();
+void MediaKick(UINT ms = 120);                  // poll the media session soon (after a button press)                           // drop rebuildable caches (no working-set trim)
+
 // Placement engine (app.cpp)
 float ScaleOf(HMONITOR m);
 RECT  WorkOf(HMONITOR m);
@@ -44,7 +61,9 @@ void  ClampWidget(Widget* w, int& x, int& y, const POINT* pref); // keep fully i
 void  ResolveOverlaps(Widget* fixed, bool updateAnchors);     // push widgets apart; `fixed` never moves
 void  UpdateAnchor(Widget* w);                                // remember position relative to nearest corner
 void  LayoutWidget(Widget* w);
-void  RenderWidget(Widget* w);
+void  RenderWidget(Widget* w, bool contentSame = false);   // contentSame: only glass/position/frame changed
+void  RenderSoon(Widget* w);                              // A2: at most one redraw per display frame
+void  FlushFrame();
 void  ScheduleRelease();
 
 // Arrange mode (arrange.cpp)
@@ -60,7 +79,8 @@ void ArrangeResizeBegin(Widget* w, int zone, POINT p);
 void ArrangeResizeMove(Widget* w, POINT p, bool alt);
 void ArrangeResizeEnd(Widget* w);
 void ArrangeResetZone(Widget* w, int zone);                   // double-click a handle
-void PreviewWidget(Widget* w);                                // live size change without moving neighbours
+void PreviewWidget(Widget* w);
+void ShowInputAt(RECT screen, float scale, const std::wstring& init, const wchar_t* cue, std::function<void(const std::wstring&)> done);                                // live size change without moving neighbours
 
 // Settings window
 void RegisterSettingsClass();

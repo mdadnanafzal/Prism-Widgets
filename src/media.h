@@ -5,6 +5,7 @@
 
 struct MediaState {
     bool available = false;     // Windows media session API usable
+    bool checked = false;       // first availability check done
     bool hasSession = false;    // something is (or was) playing
     bool playing = false;
     bool canPrev = true, canNext = true, canPlayPause = true;

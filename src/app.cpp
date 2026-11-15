@@ -1,6 +1,7 @@
 // Prism Widgets - app shell: widget windows, tray menu, config, scheduling.
 #include "app.h"
 #include "media.h"
+#include "weather.h"
 #include <psapi.h>
 #include <algorithm>
 #include <shellscalingapi.h>
@@ -9,7 +10,7 @@
 #define WM_TRAY        (WM_APP + 1)
 #define WM_SHOWSETTINGS (WM_APP + 2)
 #define WM_STARTARRANGE (WM_APP + 3)
-enum { T_TICK = 1, T_RELEASE, T_SAVE, T_WALLCHECK, T_RELOAD_CUSTOM, T_WALLRELOAD };
+enum { T_TICK = 1, T_RELEASE, T_SAVE, T_WALLCHECK, T_RELOAD_CUSTOM, T_WALLRELOAD, T_GLASS, T_RELAX, T_DEEPIDLE, T_MEDIA, T_FRAME };
 
 HINSTANCE g_inst;
 HWND g_main;
@@ -30,7 +31,7 @@ const int g_accentCount = sizeof(g_accents) / sizeof(g_accents[0]);
 const float g_sizes[] = { 0.85f, 1.0f, 1.2f, 1.45f };
 const wchar_t* g_sizeNames[] = { L"Small", L"Medium", L"Large", L"Extra large" };
 
-static void Render(Widget* w);
+static void Render(Widget* w, bool contentSame = false);
 static void ScheduleTick();
 static void ShowTrayMenu();
 
@@ -82,11 +83,53 @@ static void Layout(Widget* w) {
     w->bgValid = false;
 }
 
-static void ArmRelease() { SetTimer(g_main, T_RELEASE, 8000, nullptr); }
+static void ArmRelease() { SetTimer(g_main, T_RELEASE, 30000, nullptr); }   // keep the wallpaper proxy a while for fast re-renders
+
+// ------------------------------------------------------------------ performance + power mode
+PerfStats g_perf;
+static LONGLONG Qpc() { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
+static double QpcMs(LONGLONG d) { static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f); return d * 1000.0 / f.QuadPart; }
+static LONGLONG g_dragT0 = 0; static unsigned g_dragSteps = 0;
+void PerfDragBegin() { g_dragT0 = Qpc(); g_dragSteps = 0; }
+void PerfDragStep() { g_dragSteps++; }
+void PerfDragEnd() {
+    double sec = QpcMs(Qpc() - g_dragT0) / 1000.0;
+    if (sec > 0.25 && g_dragSteps > 2) g_perf.dragRate = g_dragSteps / sec;
+}
+void PerfClick(DWORD msgTime, LONGLONG qpcStart) {
+    // time spent waiting in the queue (ms ticks) + time we spent handling it (precise)
+    // GetTickCount has ~16 ms granularity, so queue wait only counts when it is clearly larger than that
+    double queued = std::min(1000.0, (double)(DWORD)(GetTickCount() - msgTime));
+    double ms = QpcMs(Qpc() - qpcStart) + (queued > 16 ? queued : 0);
+    g_perf.clickLast = ms;
+    g_perf.clickAvg = g_perf.clickAvg < 0 ? ms : g_perf.clickAvg * 0.8 + ms * 0.2;
+}
+typedef struct { ULONG Version, ControlMask, StateMask; } PW_THROTTLE;
+static void SetPowerMode(bool responsive) {
+    static bool init = false;
+    if (init && responsive == g_perf.responsive) return;
+    init = true;
+    g_perf.responsive = responsive;
+    // Interacting: normal priority, no throttling. Idle: below-normal + EcoQoS ("efficiency mode").
+    SetPriorityClass(GetCurrentProcess(), responsive ? NORMAL_PRIORITY_CLASS : BELOW_NORMAL_PRIORITY_CLASS);
+    PW_THROTTLE t{ 1, 1 /*EXECUTION_SPEED*/, responsive ? 0u : 1u };
+    SetProcessInformation(GetCurrentProcess(), (PROCESS_INFORMATION_CLASS)4 /*ProcessPowerThrottling*/, &t, sizeof(t));
+}
+void Interactive() {
+    SetPowerMode(true);
+    SetTimer(g_main, T_RELAX, 3000, nullptr);        // back to efficiency mode 3 s after the last interaction
+    SetTimer(g_main, T_DEEPIDLE, 10 * 60 * 1000, nullptr);   // deep memory trim only after 10 idle minutes
+}
+static bool OurWindowInFront() {
+    HWND fg = GetForegroundWindow(); wchar_t cls[32] = {};
+    if (fg) GetClassNameW(fg, cls, 32);
+    return !wcscmp(cls, L"PrismSettings") || !wcscmp(cls, L"PrismInput") || !wcscmp(cls, L"PrismArrange");
+}
 
 // ------------------------------------------------------------------ rendering
 // Draws widget content over its glass layer into the DIB selected into `mem`.
-static void DrawWidget(HDC mem, Widget* w, const Theme& t, const uint32_t* bg, int bw, int bh, int margin, float s, float lum, bool outline = false) {
+static void DrawWidget(HDC mem, Widget* w, const Theme& t, const uint32_t* bg, int bw, int bh, int margin, float s, float lum, bool outline = false,
+                       const uint32_t* content = nullptr) {
     RECT rc{ 0, 0, bw, bh };
     if (FAILED(g_gr.rt->BindDC(mem, &rc))) return;
     float dpi = 96.f * s;
@@ -108,11 +151,18 @@ static void DrawWidget(HDC mem, Widget* w, const Theme& t, const uint32_t* bg, i
         g_gr.rt->DrawBitmap(bgb, nullptr, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
         bgb->Release();
     }
+    if (content) {   // A4: pre-rendered content layer
+        ID2D1Bitmap* cb = nullptr;
+        if (SUCCEEDED(g_gr.rt->CreateBitmap(D2D1_SIZE_U{ (UINT32)bw, (UINT32)bh }, content, bw * 4, &bp, &cb))) {
+            g_gr.rt->DrawBitmap(cb, nullptr, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
+            cb->Release();
+        }
+    }
     tr._31 = tr._32 = margin / s;
     g_gr.rt->SetTransform(&tr);
     Gfx g{ g_gr.rt, g_gr.br, MakeInk(t, lum) };
     D2D1_SIZE_F bs = w->BaseSize();
-    w->Draw(g, bs.width, bs.height);
+    if (!content) w->Draw(g, bs.width, bs.height);
     if (outline) {   // Arrange mode frame: accent for the selected widget, soft white for the rest
         float r = std::min(t.radius + 1.5f, std::min(bs.width, bs.height) / 2);
         D2D1_RECT_F fr{ -1.5f, -1.5f, bs.width + 1.5f, bs.height + 1.5f };
@@ -154,10 +204,33 @@ static HBITMAP MakeDib(HDC mem, int w, int h, void** bits) {
     return CreateDIBSection(mem, &bi, DIB_RGB_COLORS, bits, nullptr, 0);
 }
 
-static void Render(Widget* w) {
+// A4: draw only the widget's content (transparent background) into w->content
+static void RenderContent(Widget* w, const Theme& t, HDC mem, void* bits) {
+    RECT rc{ 0, 0, w->bw, w->bh };
+    if (FAILED(g_gr.rt->BindDC(mem, &rc))) return;
+    float s = w->scale * w->size, dpi = 96.f * s;
+    g_gr.rt->SetDpi(dpi, dpi);
+    g_gr.rt->BeginDraw();
+    D2D1_MATRIX_3X2_F tr; tr._11 = 1; tr._12 = 0; tr._21 = 0; tr._22 = 1; tr._31 = w->margin / s; tr._32 = w->margin / s;
+    g_gr.rt->SetTransform(&tr);
+    D2D1_COLOR_F clear{ 0, 0, 0, 0 }; g_gr.rt->Clear(&clear);
+    Gfx g{ g_gr.rt, g_gr.br, MakeInk(t, w->lum) };
+    D2D1_SIZE_F bs = w->BaseSize();
+    w->Draw(g, bs.width, bs.height);
+    if (g_gr.rt->EndDraw() == (HRESULT)D2DERR_RECREATE_TARGET) g_gr.DropTarget();
+    GdiFlush();
+    w->content.assign((uint32_t*)bits, (uint32_t*)bits + (size_t)w->bw * w->bh);
+}
+static uint32_t ContentKey(Widget* w, const Theme& t) {
+    Ink k = MakeInk(t, w->lum);
+    uint32_t h = (uint32_t)(k.fg.r * 255) | ((uint32_t)(k.accent.g * 255) << 8) | ((uint32_t)k.shadow << 16);
+    return h ^ ((uint32_t)(w->scale * w->size * 1000) << 17) ^ (uint32_t)(w->bw * 31 + w->bh);
+}
+static void Render(Widget* w, bool contentSame) {
     if (!w->hwnd || !w->enabled) return;
     if (Paused()) { w->dirty = true; return; }
     if (!g_gr.EnsureTarget()) return;
+    LONGLONG t0 = Qpc();
     const Theme& t = ThemeFor(w);
     size_t n = (size_t)w->bw * w->bh;
     if (!w->bgValid || w->bg.size() != n) {
@@ -173,7 +246,16 @@ static void Render(Widget* w) {
     HBITMAP dib = MakeDib(mem, w->bw, w->bh, &bits);
     if (dib && bits) {
         HGDIOBJ old = SelectObject(mem, dib);
-        DrawWidget(mem, w, t, w->bg.data(), w->bw, w->bh, w->margin, w->scale * w->size, w->lum, g_arranging);
+        const uint32_t* content = nullptr;
+        if (g_arranging) {   // A4: keep the content layer while arranging; glass-only refreshes reuse it
+            uint32_t key = ContentKey(w, t);
+            if (!(contentSame && w->contentValid && w->contentKey == key && w->content.size() == n)) {
+                RenderContent(w, t, mem, bits);
+                w->contentValid = !w->content.empty(); w->contentKey = key;
+            }
+            if (w->contentValid) content = w->content.data();
+        } else if (w->contentValid) { w->content.clear(); w->content.shrink_to_fit(); w->contentValid = false; }
+        DrawWidget(mem, w, t, w->bg.data(), w->bw, w->bh, w->margin, w->scale * w->size, w->lum, g_arranging, content);
         POINT dst{ w->x - w->margin, w->y - w->margin }, src{ 0, 0 };
         SIZE sz{ w->bw, w->bh };
         BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
@@ -184,6 +266,14 @@ static void Render(Widget* w) {
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
     w->dirty = false;
+    {   // C1: redraw timing
+        double ms = QpcMs(Qpc() - t0);
+        ULONGLONG nowT = GetTickCount64();
+        g_perf.renderLast = ms;
+        g_perf.renderAvg = g_perf.renders ? g_perf.renderAvg * 0.9 + ms * 0.1 : ms;
+        if (ms > g_perf.renderMax || nowT - g_perf.maxAt > 60000) { g_perf.renderMax = ms; g_perf.maxAt = nowT; }
+        g_perf.renders++;
+    }
 
     // next due time
     ULONGLONG now = GetTickCount64();
@@ -303,6 +393,7 @@ static void SaveConfigNow() {
     c.set(L"snap") = JVal::MakeBool(g_snap);
     c.set(L"pauseFullscreen") = JVal::MakeBool(g_pauseFullscreen);
     c.set(L"settingsTheme") = JVal::MakeStr(g_uiTheme);
+    g_weather.SaveSettings(c.set(L"weather"));
     JVal& arr = c.set(L"widgets"); arr = JVal::MakeArr();
     for (auto& w : g_widgets) {
         JVal e = JVal::MakeObj();
@@ -339,6 +430,7 @@ static void LoadConfig() {
     g_snap = g_cfg.boolean(L"snap", true);
     g_pauseFullscreen = g_cfg.boolean(L"pauseFullscreen", true);
     g_uiTheme = g_cfg.str(L"settingsTheme", L"system");
+    g_weather.LoadSettings(g_cfg.get(L"weather"));
 }
 
 // ------------------------------------------------------------------ placement
@@ -501,7 +593,27 @@ void PreviewWidget(Widget* w) {
     ClampInPlace(w);
     Layout(w); Render(w);
 }
-void RenderWidget(Widget* w) { Render(w); }
+void RenderWidget(Widget* w, bool contentSame) { Render(w, contentSame); }
+
+// A2: while resizing, mouse moves only update the geometry; the widget is redrawn at most once per display frame.
+static Widget* g_framePending = nullptr;
+static LONGLONG g_lastFrame = 0;
+static double FrameMs() {
+    static double ms = 0;
+    if (!ms) { DEVMODEW dm{}; dm.dmSize = sizeof(dm); ms = (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) ? 1000.0 / dm.dmDisplayFrequency : 16.7; }
+    return ms;
+}
+void FlushFrame() {
+    KillTimer(g_main, T_FRAME);
+    Widget* w = g_framePending; g_framePending = nullptr;
+    for (auto& x : g_widgets) if (x.get() == w && w->enabled && w->hwnd) { Layout(w); Render(w); PerfDragStep(); g_lastFrame = Qpc(); break; }
+}
+void RenderSoon(Widget* w) {
+    g_framePending = w;
+    double since = QpcMs(Qpc() - g_lastFrame);
+    if (since >= FrameMs()) FlushFrame();
+    else SetTimer(g_main, T_FRAME, (UINT)std::ceil(FrameMs() - since), nullptr);   // catches the final size when the mouse stops
+}
 void ScheduleRelease() { ArmRelease(); }
 
 // Re-derive every position after resolution / DPI / taskbar / monitor changes.
@@ -545,6 +657,7 @@ static void ShowWidget(Widget* w) {
 static void BuildWidgets() {
     g_widgets.clear();
     g_widgets.push_back(MakeClock());
+    g_widgets.push_back(MakeWeather());
     g_widgets.push_back(MakeCalendar());
     g_widgets.push_back(MakeTodo());
     g_widgets.push_back(MakeMedia());
@@ -606,9 +719,16 @@ static void Snap(Widget* w, int& x, int& y) {
 
 // ------------------------------------------------------------------ services used by Settings
 void ApplyWidget(Widget* w) {
+    if (w->key == L"media" && w->enabled) MediaKick(100);
     ShowWidget(w);                              // re-derives from its anchor, so growing keeps the anchored edge
     if (w->enabled) { if (!w->hasAnchor) UpdateAnchor(w); ResolveOverlaps(w, true); }
     ScheduleTick(); RequestSave();
+}
+// Posted (never synchronous): weather state can change while a widget is being drawn.
+void WeatherChanged() { PostMessageW(g_main, WM_APP + 7, 0, 0); }
+static void OnWeatherChanged() {
+    for (auto& w : g_widgets) if (w->key == L"weather" && w->enabled && w->hwnd) Render(w.get());
+    SettingsRefresh(true);
 }
 void ApplyGlobal(bool rebuildGlass) { Widget_RenderAll(rebuildGlass); RequestSave(); }
 void ResetPositions() {
@@ -617,7 +737,37 @@ void ResetPositions() {
     ResolveOverlaps(nullptr, true);
     ScheduleTick(); RequestSave();
 }
-void FreeMemoryNow() { g_wall.Release(); g_gr.ClearFormats(); TrimMemory(); }
+// B4: the media session is polled here, outside of drawing; the widget redraws only on changes (or each second while playing)
+static Widget* MediaWidgetOn() { for (auto& w : g_widgets) if (w->key == L"media" && w->enabled && w->hwnd) return w.get(); return nullptr; }
+void MediaKick(UINT ms) { SetTimer(g_main, T_MEDIA, ms, nullptr); }
+static void MediaTick() {
+    KillTimer(g_main, T_MEDIA);
+    Widget* mw = MediaWidgetOn();
+    if (!mw) return;                                  // stops until the widget is shown again
+    if (Paused()) { MediaKick(3000); return; }
+    bool changed = g_media.Pump();
+    if (changed || g_media.st.playing) Render(mw);   // progress bar moves while playing
+    MediaKick(g_media.Busy() ? 200 : (g_media.st.playing ? 1000 : 2000));
+}
+void ReleaseCaches() { g_wall.Release(); g_gr.ClearFormats(); HeapCompact(GetProcessHeap(), 0); }
+void FreeMemoryNow() { ReleaseCaches(); TrimMemory(); }
+
+// A1: during a drag the finished picture just slides; the glass is resampled when the mouse rests or on drop.
+static Widget* g_glassPending = nullptr;
+void MoveWidgetFast(Widget* w) {
+    if (!w->hwnd) return;
+    float s = ScaleOf(MonitorAt(w->x + 8, w->y + 8));
+    if (std::fabs(s - w->scale) > 0.01f) { Layout(w); Render(w); return; }   // moved onto a monitor with other scaling
+    w->bgValid = false;
+    SetWindowPos(w->hwnd, nullptr, w->x - w->margin, w->y - w->margin, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    g_glassPending = w;
+    SetTimer(g_main, T_GLASS, 140, nullptr);
+}
+static void FlushGlass() {
+    KillTimer(g_main, T_GLASS);
+    Widget* w = g_glassPending; g_glassPending = nullptr;
+    for (auto& x : g_widgets) if (x.get() == w && w->enabled && w->hwnd && !w->bgValid) { Render(w, true); break; }
+}
 void QuitApp() { DestroyWindow(g_main); }
 void OpenDataFolder() { ShellExecuteW(nullptr, L"open", AppDataDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
 
@@ -660,9 +810,13 @@ static LRESULT CALLBACK InputProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, m, wp, lp);
 }
 void ShowInput(Widget* w, D2D1_RECT_F lr, const std::wstring& init, std::function<void(const std::wstring&)> done) {
+    float sc = w->scale * w->size;
+    int x = w->x + (int)(lr.left * sc), y = w->y + (int)(lr.top * sc);
+    ShowInputAt(RECT{ x, y, x + (int)((lr.right - lr.left) * sc), y + (int)((lr.bottom - lr.top) * sc) }, sc, init, L"Type and press Enter", std::move(done));
+}
+void ShowInputAt(RECT rc, float s, const std::wstring& init, const wchar_t* cue, std::function<void(const std::wstring&)> done) {
     CloseInput(false);
-    float s = w->scale * w->size;
-    int x = w->x + (int)(lr.left * s), y = w->y + (int)(lr.top * s), wd = (int)((lr.right - lr.left) * s), ht = (int)((lr.bottom - lr.top) * s);
+    int x = rc.left, y = rc.top, wd = rc.right - rc.left, ht = rc.bottom - rc.top;
     g_input.done = std::move(done);
     g_input.bg = CreateSolidBrush(RGB(32, 32, 36));
     g_input.wnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"PrismInput", L"", WS_POPUP, x, y, wd, ht, nullptr, nullptr, g_inst, nullptr);
@@ -676,7 +830,7 @@ void ShowInput(Widget* w, D2D1_RECT_F lr, const std::wstring& init, std::functio
     g_input.font = CreateFontW(-fh, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI Variable Text");
     g_input.edit = CreateWindowExW(0, L"EDIT", init.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, pad, (ht - fh - 4) / 2, wd - 2 * pad, fh + 4, g_input.wnd, nullptr, g_inst, nullptr);
     SendMessageW(g_input.edit, WM_SETFONT, (WPARAM)g_input.font, TRUE);
-    SendMessageW(g_input.edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type and press Enter");
+    SendMessageW(g_input.edit, EM_SETCUEBANNER, TRUE, (LPARAM)cue);
     SendMessageW(g_input.edit, EM_SETSEL, 0, -1);
     g_input.oldProc = (WNDPROC)SetWindowLongPtrW(g_input.edit, GWLP_WNDPROC, (LONG_PTR)EditProc);
     ShowWindow(g_input.wnd, SW_SHOW);
@@ -747,12 +901,14 @@ static LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONDBLCLK:
+        Interactive();
         if (g_arranging && w == g_arrangeSel) {
             int zone = ArrangeZone(w, LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)));
             if (zone >= 0) { ArrangeResetZone(w, zone); return 0; }
         }
         [[fallthrough]];
     case WM_LBUTTONDOWN:
+        Interactive();
         if (g_arranging) {
             float lx = LocalX(w, GET_X_LPARAM(lp)), ly = LocalY(w, GET_Y_LPARAM(lp));
             POINT cp; GetCursorPos(&cp);
@@ -769,12 +925,21 @@ static LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 w = o; h = o->hwnd;
             }
             ArrangeSelect(w);
+        } else {
+            int id;   // B3: show the press immediately
+            if (w->HitId(LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)), id)) {
+                LONGLONG q0 = Qpc();
+                w->isPressed = true; w->pressed = id;
+                Render(w);
+                PerfClick(GetMessageTime(), q0);
+            }
         }
         SetCapture(h);
         g_drag.w = w; g_drag.down = true; g_drag.dragging = false;
         GetCursorPos(&g_drag.start); g_drag.ox = w->x; g_drag.oy = w->y;
         return 0;
     case WM_MOUSEMOVE: {
+        Interactive();
         if (g_drag.down && g_drag.w == w && g_drag.resizing) {
             POINT p; GetCursorPos(&p);
             ArrangeResizeMove(w, p, (GetKeyState(VK_MENU) & 0x8000) != 0);
@@ -783,14 +948,17 @@ static LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (g_drag.down && g_drag.w == w) {
             POINT p; GetCursorPos(&p);
             int dx = p.x - g_drag.start.x, dy = p.y - g_drag.start.y;
-            if (!g_drag.dragging && (g_arranging || g_quickDrag) && (std::abs(dx) > 4 || std::abs(dy) > 4)) g_drag.dragging = true;
+            if (!g_drag.dragging && (g_arranging || g_quickDrag) && (std::abs(dx) > 4 || std::abs(dy) > 4)) {
+                g_drag.dragging = true; PerfDragBegin();
+                if (w->isPressed) { w->isPressed = false; Render(w); }
+            }
             if (g_drag.dragging) {
                 int nx = g_drag.ox + dx, ny = g_drag.oy + dy;
                 bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;   // hold Alt for free placement
                 if (g_arranging) { if (alt) ArrangeClearGuides(); else ArrangeSnap(w, nx, ny, p); }
                 else if (g_snap && !alt) Snap(w, nx, ny);
                 ClampWidget(w, nx, ny, &p);                        // never leaves the screen
-                if (nx != w->x || ny != w->y) { w->x = nx; w->y = ny; Layout(w); Render(w); }
+                if (nx != w->x || ny != w->y) { w->x = nx; w->y = ny; MoveWidgetFast(w); PerfDragStep(); }
             }
             return 0;
         }
@@ -811,15 +979,23 @@ static LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             ReleaseCapture();
             if (dragged) {
                 if (g_arranging) ArrangeClearGuides();
+                PerfDragEnd();
+                g_glassPending = w; FlushGlass();   // final glass at the drop position
                 w->placed = true;
                 UpdateAnchor(w);
                 ResolveOverlaps(w, true);   // neighbours make room
                 RequestSave(); ArmRelease();
             }
-            else if (!g_arranging && w->Click(LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)))) { Render(w); RequestSave(); }
+            else if (!g_arranging) {
+                bool wasPressed = w->isPressed; w->isPressed = false;
+                if (w->Click(LocalX(w, GET_X_LPARAM(lp)), LocalY(w, GET_Y_LPARAM(lp)))) { Render(w); RequestSave(); }
+                else if (wasPressed) Render(w);   // release the pressed look
+            }
+            if (w->isPressed) { w->isPressed = false; Render(w); }
         }
         return 0;
     case WM_CAPTURECHANGED:
+        if (w->isPressed && (HWND)lp != h) { w->isPressed = false; Render(w); }
         if (g_drag.w == w && (HWND)lp != h && g_drag.resizing) {
             g_drag.down = g_drag.resizing = false; g_drag.w = nullptr;
             ArrangeResizeEnd(w);
@@ -832,11 +1008,12 @@ static LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_MOUSELEAVE: if (!g_arranging) { w->Leave(); Render(w); } return 0;
     case WM_MOUSEWHEEL: {
+        Interactive();
         POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(h, &p);
         if (!g_arranging && w->Wheel(LocalX(w, p.x), LocalY(w, p.y), GET_WHEEL_DELTA_WPARAM(wp))) Render(w);
         return 0;
     }
-    case WM_RBUTTONUP: WidgetMenu(w, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+    case WM_RBUTTONUP: Interactive(); WidgetMenu(w, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
     case WM_SETCURSOR: {
         LPCWSTR cur = g_quickDrag ? IDC_SIZEALL : IDC_ARROW;
         if (g_arranging) {
@@ -985,15 +1162,35 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         case T_TICK: KillTimer(h, T_TICK); OnTick(); break;
         case T_RELEASE:   // drop wallpaper proxies + trim working set once idle
             KillTimer(h, T_RELEASE);
-            if (!g_drag.dragging && !g_arranging) { g_wall.Release(); g_gr.ClearFormats(); TrimMemory(); }
+            if (!g_drag.dragging && !g_arranging) g_wall.Release();   // proxy only; no working-set trim here (B2)
             break;
         case T_SAVE: KillTimer(h, T_SAVE); SaveConfigNow(); break;
         case T_WALLCHECK: { std::wstring s = g_wall.Signature(); if (s != g_wallSig) ReloadWallpaper(); break; }
         case T_RELOAD_CUSTOM: KillTimer(h, T_RELOAD_CUSTOM); ReloadCustom(); break;
         case T_WALLRELOAD: KillTimer(h, T_WALLRELOAD); ReloadWallpaper(); break;
+        case T_GLASS: FlushGlass(); break;
+        case T_MEDIA: MediaTick(); break;
+        case T_FRAME: FlushFrame(); break;
+        case T_RELAX:
+            if (g_arranging || g_drag.down || OurWindowInFront()) break;   // still being used: stay responsive
+            KillTimer(h, T_RELAX); SetPowerMode(false);
+            break;
+        case T_DEEPIDLE:   // 10 idle minutes: now it's worth giving memory back to Windows
+            KillTimer(h, T_DEEPIDLE);
+            if (!g_arranging && !g_drag.down && !OurWindowInFront()) { ReleaseCaches(); TrimMemory(); }
+            else SetTimer(h, T_DEEPIDLE, 10 * 60 * 1000, nullptr);
+            break;
+        case WEATHER_TIMER_ID: {
+            KillTimer(h, WEATHER_TIMER_ID);
+            bool on = false; for (auto& w : g_widgets) if (w->key == L"weather" && w->enabled) on = true;
+            if (on && !Paused()) g_weather.Refresh(false);
+            else if (on) SetTimer(h, WEATHER_TIMER_ID, 5 * 60 * 1000, nullptr);   // try again after the game / lock
+            break;
+        }
         }
         return 0;
     case WM_TRAY:
+        Interactive();
         switch (LOWORD(lp)) {
         case WM_CONTEXTMENU: ShowTrayMenu(); break;
         case NIN_SELECT: case NIN_KEYSELECT: OpenSettings(); break;
@@ -1001,6 +1198,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_SHOWSETTINGS: OpenSettings(); return 0;
     case WM_STARTARRANGE: StartArrange(); return 0;
+    case WM_WEATHER: g_weather.OnResult(wp, lp); return 0;
+    case WM_APP + 7: { MSG dup; while (PeekMessageW(&dup, h, WM_APP + 7, WM_APP + 7, PM_REMOVE)) {} OnWeatherChanged(); return 0; }
     case WM_APP + 9: if (g_input.wnd && GetForegroundWindow() != g_input.wnd) CloseInput(true); return 0;
     case WM_SETTINGCHANGE:
         if (wp == SPI_SETDESKWALLPAPER) SetTimer(h, T_WALLRELOAD, 700, nullptr);
@@ -1020,7 +1219,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 g_displayOff = *(DWORD*)ps->Data == 0;
                 if (!g_displayOff) SetTimer(h, T_TICK, 200, nullptr);
             }
-        } else if (wp == PBT_APMRESUMEAUTOMATIC) Widget_RenderAll(false);
+        } else if (wp == PBT_APMRESUMEAUTOMATIC) { Widget_RenderAll(false); SetTimer(h, WEATHER_TIMER_ID, 15000, nullptr); }   // fresh weather after sleep
         return TRUE;
     case WM_DESTROY:
         EndArrange();
@@ -1034,15 +1233,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 // ------------------------------------------------------------------ entry
-typedef struct { ULONG Version, ControlMask, StateMask; } PW_THROTTLE;
 static void BeLightweight() {
-    // Below-normal priority + EcoQoS ("efficiency mode") + low memory priority:
-    // the OS treats the widgets as the least important thing running.
-    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
-    PW_THROTTLE t{ 1, 1, 1 };                     // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-    SetProcessInformation(GetCurrentProcess(), (PROCESS_INFORMATION_CLASS)4 /*ProcessPowerThrottling*/, &t, sizeof(t));
-    ULONG memPrio = 2;                            // MEMORY_PRIORITY_LOW
-    SetProcessInformation(GetCurrentProcess(), (PROCESS_INFORMATION_CLASS)0 /*ProcessMemoryPriority*/, &memPrio, sizeof(memPrio));
+    // Start in efficiency mode (below-normal + EcoQoS). Memory priority stays normal so Windows doesn't
+    // page us out first; that caused slow first clicks after idle (B2).
+    SetPowerMode(false);
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
@@ -1102,6 +1296,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     ScheduleTick();
     SetTimer(g_main, T_WALLCHECK, 60000, nullptr);   // catches slideshow / Spotlight wallpaper changes
     ArmRelease();
+    SetTimer(g_main, T_DEEPIDLE, 10 * 60 * 1000, nullptr);
+    MediaKick(400);
 
     g_dirWatch = FindFirstChangeNotificationW(CustomWidgetDir().c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE);
 
@@ -1125,6 +1321,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     if (g_dirWatch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(g_dirWatch);
     g_widgets.clear();
     g_media.Shutdown();
+    g_weather.Shutdown();
     if (pn) UnregisterPowerSettingNotification(pn);
     WTSUnRegisterSessionNotification(g_main);
     g_gr.DropTarget(); g_gr.ClearFormats();

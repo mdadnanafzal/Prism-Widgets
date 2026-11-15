@@ -167,6 +167,7 @@ int BarHit(LPARAM lp) {
     return -1;
 }
 LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_MOUSEMOVE || m == WM_LBUTTONDOWN) Interactive();
     switch (m) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_MOUSEMOVE: {
@@ -196,12 +197,13 @@ void Nudge(int dx, int dy) {
     ClampWidget(w, x, y, nullptr);
     if (x == w->x && y == w->y) return;
     w->x = x; w->y = y;
-    LayoutWidget(w); RenderWidget(w);
+    MoveWidgetFast(w);       // slide now, refresh the glass when the keys pause
     UpdateAnchor(w);
     RequestSave();
 }
 
 LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_KEYDOWN || m == WM_MOUSEMOVE || m == WM_LBUTTONDOWN) Interactive();
     switch (m) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); PaintOverlay(dc, ps.rcPaint); EndPaint(h, &ps); return 0; }
@@ -250,6 +252,7 @@ void Register() {
 void StartArrange() {
     if (g_arranging) { if (O.wnd) SetForegroundWindow(O.wnd); return; }
     Register();
+    Interactive();
     g_arranging = true;
     g_arrangeSel = nullptr;
     BuildDimmedWallpaper();
@@ -290,6 +293,7 @@ void EndArrange() {
     if (O.wnd) DestroyWindow(O.wnd);
     O = Overlay();
     ResolveOverlaps(nullptr, true);
+    for (auto& w : g_widgets) { w->content.clear(); w->content.shrink_to_fit(); w->contentValid = false; }   // A4 cache is Arrange-only
     for (auto& w : g_widgets) if (w->enabled && w->hwnd) {
         SetWindowPos(w->hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // back onto the desktop
         RenderWidget(w.get());
@@ -303,9 +307,9 @@ void ArrangeSelect(Widget* w) {
     if (w == g_arrangeSel) return;
     Widget* old = g_arrangeSel;
     g_arrangeSel = w;
-    if (old) RenderWidget(old);
+    if (old) RenderWidget(old, true);     // only the frame changes: reuse the content layer
     if (w) {
-        RenderWidget(w);
+        RenderWidget(w, true);
         SetWindowPos(w->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // its handles above neighbours
         if (O.bar) SetWindowPos(O.bar, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
@@ -446,6 +450,7 @@ void ArrangeResizeBegin(Widget* w, int zone, POINT p) {
     D2D1_SIZE_F b = w->BaseSize(); R.cw0 = b.width; R.ch0 = b.height; R.size0 = w->size;
     HMONITOR hm = MonitorFromRect(&pr, MONITOR_DEFAULTTONEAREST);
     R.s = ScaleOf(hm); R.wa = WorkOf(hm);
+    PerfDragBegin();
 }
 
 void ArrangeResizeMove(Widget* w, POINT p, bool alt) {
@@ -540,12 +545,13 @@ void ArrangeResizeMove(Widget* w, POINT p, bool alt) {
     }
     g_arrangeBadge = badge;
     SetGuides(std::move(gs));
-    LayoutWidget(w);
-    RenderWidget(w);
+    RenderSoon(w);    // A2: coalesced to the display's frame rate
 }
 
 void ArrangeResizeEnd(Widget* w) {
     if (R.w != w) return;
+    FlushFrame();
+    PerfDragEnd();
     R = ResizeState();
     g_arrangeBadge.clear();
     ArrangeClearGuides();

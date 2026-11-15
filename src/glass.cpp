@@ -200,28 +200,6 @@ std::wstring Wallpaper::Signature() {
 }
 
 // ------------------------------------------------------------------ blur
-static void BoxBlurPass(std::vector<uint32_t>& img, std::vector<uint32_t>& tmp, int w, int h, int r, bool horiz) {
-    int len = horiz ? w : h, lines = horiz ? h : w;
-    if (len <= 1 || r <= 0) return;
-    std::vector<uint32_t> line(len);
-    float inv = 1.0f / (2 * r + 1);
-    for (int l = 0; l < lines; l++) {
-        for (int i = 0; i < len; i++) line[i] = horiz ? img[(size_t)l * w + i] : img[(size_t)i * w + l];
-        int sr = 0, sg = 0, sb = 0;
-        for (int k = -r; k <= r; k++) { uint32_t p = line[Clamp(k, 0, len - 1)]; sr += (p >> 16) & 255; sg += (p >> 8) & 255; sb += p & 255; }
-        for (int i = 0; i < len; i++) {
-            uint32_t v = 0xFF000000u | ((uint32_t)(sr * inv + .5f) << 16) | ((uint32_t)(sg * inv + .5f) << 8) | (uint32_t)(sb * inv + .5f);
-            if (horiz) tmp[(size_t)l * w + i] = v; else tmp[(size_t)i * w + l] = v;
-            uint32_t a = line[std::min(i + r + 1, len - 1)], b = line[std::max(i - r, 0)];
-            sr += (int)((a >> 16) & 255) - (int)((b >> 16) & 255);
-            sg += (int)((a >> 8) & 255) - (int)((b >> 8) & 255);
-            sb += (int)(a & 255) - (int)(b & 255);
-        }
-    }
-    img.swap(tmp);
-}
-
-static inline float Smooth(float e0, float e1, float x) { float t = Clamp((x - e0) / (e1 - e0), 0.f, 1.f); return t * t * (3 - 2 * t); }
 
 // Signed distance to a rounded rectangle (negative inside) + outward normal.
 static inline float SdRound(float px, float py, float cx, float cy, float hx, float hy, float r, float* nx, float* ny) {
@@ -237,6 +215,33 @@ static inline float SdRound(float px, float py, float cx, float cy, float hx, fl
     return ol + std::min(std::max(qx, qy), 0.f) - r;
 }
 
+// Box blur on a float plane (sliding window, cost independent of radius)
+static void BlurPlane(float* img, float* tmp, int w, int h, int r) {
+    if (r <= 0) return;
+    float inv = 1.0f / (2 * r + 1);
+    for (int y = 0; y < h; y++) {           // horizontal
+        const float* row = img + (size_t)y * w; float* o = tmp + (size_t)y * w;
+        float sum = 0;
+        for (int k = -r; k <= r; k++) sum += row[Clamp(k, 0, w - 1)];
+        for (int x = 0; x < w; x++) {
+            o[x] = sum * inv;
+            sum += row[std::min(x + r + 1, w - 1)] - row[std::max(x - r, 0)];
+        }
+    }
+    for (int x = 0; x < w; x++) {           // vertical
+        float sum = 0;
+        for (int k = -r; k <= r; k++) sum += tmp[(size_t)Clamp(k, 0, h - 1) * w + x];
+        for (int y = 0; y < h; y++) {
+            img[(size_t)y * w + x] = sum * inv;
+            sum += tmp[(size_t)std::min(y + r + 1, h - 1) * w + x] - tmp[(size_t)std::max(y - r, 0) * w + x];
+        }
+    }
+}
+
+// A3: faster glass. Same look as before, but:
+//  * the wallpaper is sampled + blurred at reduced resolution (blurred content has no fine detail),
+//  * the panel interior (where rim / glow / refraction are invisible) takes a cheap fast path,
+//  * exp()/pow() terms come from small lookup tables.
 void RenderBackground(const Theme& t, int sx, int sy, int w, int h, int margin, float scale,
                       D2D1_COLOR_F accent, uint32_t* out, float* lumOut) {
     RECT wr{ sx, sy, sx + w, sy + h };
@@ -261,75 +266,111 @@ void RenderBackground(const Theme& t, int sx, int sy, int w, int h, int margin, 
     }
 
     float sigma = t.blur * scale, refr = t.refraction * scale;
-    int br = sigma > 0.5f ? std::max(1, (int)std::round((std::sqrt(4 * sigma * sigma + 1) - 1) / 2)) : 0;
-    int pad = 3 * br + (int)std::ceil(refr) + 2;
-    int bw = w + 2 * pad, bh = h + 2 * pad;
-    std::vector<uint32_t> B((size_t)bw * bh), T((size_t)bw * bh);
-    for (int y = 0; y < bh; y++) for (int x = 0; x < bw; x++) {
-        float r, g, b; g_wall.Sample(mon, sx - pad + x + .5f, sy - pad + y + .5f, r, g, b);
-        B[(size_t)y * bw + x] = 0xFF000000u | ((uint32_t)(r * 255 + .5f) << 16) | ((uint32_t)(g * 255 + .5f) << 8) | (uint32_t)(b * 255 + .5f);
+    // working resolution for the blurred wallpaper: coarser when the blur is strong or the proxy is coarse anyway
+    float f = std::max(1.f, std::min(4.f, sigma / 2.5f));
+    f = std::max(f, std::min(3.f, g_wall.PhysPerProxy(mon)));
+    float sb = sigma / f;
+    int br = sb > 0.5f ? std::max(1, (int)std::round((std::sqrt(4 * sb * sb + 1) - 1) / 2)) : 0;
+    int pad = (int)std::ceil(3 * br * f + refr + 2 * f + 2);
+    int bw = (int)std::ceil((w + 2 * pad) / f) + 2, bh = (int)std::ceil((h + 2 * pad) / f) + 2;
+    size_t bn = (size_t)bw * bh;
+    std::vector<float> P(bn * 4);                 // R, G, B planes + temp
+    float *PR = P.data(), *PG = PR + bn, *PB = PG + bn, *TMP = PB + bn;
+    for (int j = 0; j < bh; j++) for (int i = 0; i < bw; i++) {
+        float r, g, b;
+        g_wall.Sample(mon, sx - pad + (i + .5f) * f, sy - pad + (j + .5f) * f, r, g, b);
+        size_t k = (size_t)j * bw + i; PR[k] = r; PG[k] = g; PB[k] = b;
     }
-    for (int i = 0; i < 3 && br > 0; i++) { BoxBlurPass(B, T, bw, bh, br, true); BoxBlurPass(B, T, bw, bh, br, false); }
-    T.clear(); T.shrink_to_fit();
+    for (int i = 0; i < 3 && br > 0; i++) { BlurPlane(PR, TMP, bw, bh, br); BlurPlane(PG, TMP, bw, bh, br); BlurPlane(PB, TMP, bw, bh, br); }
 
-    auto fetch = [&](float fx, float fy, int sh) -> float {
-        fx = Clamp(fx - .5f, 0.f, (float)(bw - 1)); fy = Clamp(fy - .5f, 0.f, (float)(bh - 1));
-        int ix = (int)fx, iy = (int)fy, jx = std::min(ix + 1, bw - 1), jy = std::min(iy + 1, bh - 1);
-        float ax = fx - ix, ay = fy - iy;
-        float a = ((B[(size_t)iy * bw + ix] >> sh) & 255) * (1 - ax) + ((B[(size_t)iy * bw + jx] >> sh) & 255) * ax;
-        float c = ((B[(size_t)jy * bw + ix] >> sh) & 255) * (1 - ax) + ((B[(size_t)jy * bw + jx] >> sh) & 255) * ax;
-        return (a * (1 - ay) + c * ay) / 255.f;
+    const float invf = 1.f / f, offs = pad * invf - 0.5f;
+    auto fetch = [&](const float* pl, float fx, float fy) -> float {   // fx, fy in window px
+        float u = Clamp(fx * invf + offs, 0.f, (float)(bw - 1)), v = Clamp(fy * invf + offs, 0.f, (float)(bh - 1));
+        int iu = (int)u, iv = (int)v, ju = std::min(iu + 1, bw - 1), jv = std::min(iv + 1, bh - 1);
+        float au = u - iu, av = v - iv;
+        const float* r0 = pl + (size_t)iv * bw; const float* r1 = pl + (size_t)jv * bw;
+        return (r0[iu] * (1 - au) + r0[ju] * au) * (1 - av) + (r1[iu] * (1 - au) + r1[ju] * au) * av;
     };
 
     float tr = t.tr, tg = t.tg, tb = t.tb;
     if (tr < 0) { tr = accent.r; tg = accent.g; tb = accent.b; }
+    const float ta = t.ta, sat = t.saturation, bri = t.brightness;
+    const float trA = tr * ta, tgA = tg * ta, tbA = tb * ta, keep = 1 - ta;
     float shSize = std::max(1.f, t.shadowSize * scale), shOff = shSize * 0.3f;
-    float rimW = 1.3f * scale, glowW = 7.f * scale, zone = std::max(1.f, std::min(rad * 1.15f, std::min(hx, hy)));
+    float rimW = 1.3f * scale, glowW = 7.f * scale, bordW = 0.7f * scale, zone = std::max(1.f, std::min(rad * 1.15f, std::min(hx, hy)));
     const float lx = -0.55f, ly = -0.835f; // light from top-left
+
+    // lookup tables over edge distance e (quarter-pixel steps) and shadow distance
+    float B = std::max({ refr > 0 ? zone : 0.f, rad, 8 * rimW, 4.5f * glowW, 8 * bordW }) + 1.f;   // beyond B the edge terms are invisible
+    int ne = (int)std::ceil(B * 4) + 2;
+    std::vector<float> eRim(ne), eGlow(ne), eBord(ne), eRefr(ne);
+    for (int i = 0; i < ne; i++) {
+        float e = i * 0.25f;
+        eRim[i] = std::exp(-e / rimW); eGlow[i] = std::exp(-e / glowW); eBord[i] = t.border * std::exp(-e / bordW);
+        float k = Clamp(1 - e / zone, 0.f, 1.f); eRefr[i] = refr * k * k;
+    }
+    const int ns = 256;
+    float shLut[ns + 1];
+    for (int i = 0; i <= ns; i++) shLut[i] = t.shadow * std::pow(1 - i / (float)ns, 2.2f);
+    auto shadowAt = [&](float ds) { if (ds <= 0) return t.shadow; if (ds >= shSize) return 0.f; return shLut[(int)(ds / shSize * ns)]; };
+
+    // the interior box where every edge term is negligible
+    float ix0 = x0 + B, ix1 = x1 - B, iy0 = y0 + B, iy1 = y1 - B;
     double lsum = 0; int ln = 0;
+    auto finish = [&](float r, float g, float b, int x, int y, float py) -> void {
+        float L = .2126f * r + .7152f * g + .0722f * b;
+        r = (L + (r - L) * sat) * bri; g = (L + (g - L) * sat) * bri; b = (L + (b - L) * sat) * bri;
+        r = r * keep + trA; g = g * keep + tgA; b = b * keep + tbA;
+        if (t.noise > 0) {
+            uint32_t hsh = (uint32_t)(x * 73856093u) ^ (uint32_t)(y * 19349663u); hsh ^= hsh >> 13; hsh *= 0x5bd1e995u; hsh ^= hsh >> 15;
+            float n = ((hsh & 255) / 255.f - .5f) * t.noise; r += n; g += n; b += n;
+        }
+        if (t.rim > 0) { float sh = t.rim * 0.045f * (1 - Clamp((py - y0) / (y1 - y0), 0.f, 1.f)); r += sh; g += sh; b += sh; }
+        out[(size_t)y * w + x] = 0xFF000000u | ((uint32_t)(Clamp(r, 0.f, 1.f) * 255 + .5f) << 16) |
+                                 ((uint32_t)(Clamp(g, 0.f, 1.f) * 255 + .5f) << 8) | (uint32_t)(Clamp(b, 0.f, 1.f) * 255 + .5f);
+    };
 
     for (int y = 0; y < h; y++) {
+        float py = y + .5f;
+        bool rowInterior = py >= iy0 && py <= iy1;
         for (int x = 0; x < w; x++) {
-            float px = x + .5f, py = y + .5f;
+            float px = x + .5f;
+            if (rowInterior && px >= ix0 && px <= ix1) {   // ---- fast path: plain tinted glass
+                finish(fetch(PR, px, py), fetch(PG, px, py), fetch(PB, px, py), x, y, py);
+                if (((x | y) & 3) == 0) { uint32_t p = out[(size_t)y * w + x]; lsum += (.2126f * ((p >> 16) & 255) + .7152f * ((p >> 8) & 255) + .0722f * (p & 255)) / 255.f; ln++; }
+                continue;
+            }
             float ds = SdRound(px, py - shOff, cx, cy, hx, hy, rad, nullptr, nullptr);
-            float sa = ds <= 0 ? t.shadow : t.shadow * std::pow(Clamp(1 - ds / shSize, 0.f, 1.f), 2.2f);
+            float sa = shadowAt(ds);
             float nx = 0, ny = 0;
             float d = SdRound(px, py, cx, cy, hx, hy, rad, &nx, &ny);
             float cov = Clamp(0.5f - d, 0.f, 1.f);
             if (cov <= 0) { out[(size_t)y * w + x] = ((uint32_t)(sa * 255 + .5f)) << 24; continue; }
             float e = std::max(-d, 0.f);
-            float bx = px + pad, by = py + pad, r, g, b;
-            if (refr > 0) {
-                float k = Clamp(1 - e / zone, 0.f, 1.f); k = refr * k * k;
+            int ei = std::min((int)(e * 4), ne - 1);
+            float r, g, b;
+            float k = refr > 0 ? eRefr[ei] : 0;
+            if (k > 0.01f) {
                 float c = t.chroma;
-                r = fetch(bx + nx * k * (1 + c), by + ny * k * (1 + c), 16);
-                g = fetch(bx + nx * k, by + ny * k, 8);
-                b = fetch(bx + nx * k * (1 - c), by + ny * k * (1 - c), 0);
-            } else {
-                uint32_t p = B[(size_t)y * bw + x + (size_t)pad * bw + pad];
-                r = ((p >> 16) & 255) / 255.f; g = ((p >> 8) & 255) / 255.f; b = (p & 255) / 255.f;
-            }
+                r = fetch(PR, px + nx * k * (1 + c), py + ny * k * (1 + c));
+                g = fetch(PG, px + nx * k, py + ny * k);
+                b = fetch(PB, px + nx * k * (1 - c), py + ny * k * (1 - c));
+            } else { r = fetch(PR, px, py); g = fetch(PG, px, py); b = fetch(PB, px, py); }
             float L = .2126f * r + .7152f * g + .0722f * b;
-            r = (L + (r - L) * t.saturation) * t.brightness;
-            g = (L + (g - L) * t.saturation) * t.brightness;
-            b = (L + (b - L) * t.saturation) * t.brightness;
-            r = r * (1 - t.ta) + tr * t.ta; g = g * (1 - t.ta) + tg * t.ta; b = b * (1 - t.ta) + tb * t.ta;
+            r = (L + (r - L) * sat) * bri; g = (L + (g - L) * sat) * bri; b = (L + (b - L) * sat) * bri;
+            r = r * keep + trA; g = g * keep + tgA; b = b * keep + tbA;
             if (t.noise > 0) {
                 uint32_t hsh = (uint32_t)(x * 73856093u) ^ (uint32_t)(y * 19349663u); hsh ^= hsh >> 13; hsh *= 0x5bd1e995u; hsh ^= hsh >> 15;
                 float n = ((hsh & 255) / 255.f - .5f) * t.noise; r += n; g += n; b += n;
             }
             if (t.rim > 0) {
                 float dl = nx * lx + ny * ly;
-                float edge = std::exp(-e / rimW);
-                float spec = t.rim * edge * (0.16f + 0.8f * std::max(dl, 0.f) + 0.38f * std::max(-dl, 0.f));
-                float glow = t.rim * 0.10f * std::exp(-e / glowW) * std::max(dl, 0.f);
+                float spec = t.rim * eRim[ei] * (0.16f + 0.8f * std::max(dl, 0.f) + 0.38f * std::max(-dl, 0.f));
+                float glow = t.rim * 0.10f * eGlow[ei] * std::max(dl, 0.f);
                 float sheen = t.rim * 0.045f * (1 - Clamp((py - y0) / (y1 - y0), 0.f, 1.f));
-                r += spec + glow + sheen; g += spec + glow + sheen; b += spec + glow + sheen;
+                float add = spec + glow + sheen; r += add; g += add; b += add;
             }
-            if (t.border > 0) {
-                float bd = t.border * std::exp(-e / (0.7f * scale));
-                r += (1 - r) * bd; g += (1 - g) * bd; b += (1 - b) * bd;
-            }
+            if (t.border > 0) { float bd = eBord[ei]; r += (1 - r) * bd; g += (1 - g) * bd; b += (1 - b) * bd; }
             r = Clamp(r, 0.f, 1.f); g = Clamp(g, 0.f, 1.f); b = Clamp(b, 0.f, 1.f);
             if (e > 6 * scale && ((x | y) & 3) == 0) { lsum += .2126f * r + .7152f * g + .0722f * b; ln++; }
             float a = cov + sa * (1 - cov);

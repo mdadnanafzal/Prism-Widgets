@@ -1,6 +1,6 @@
 # Prism Widgets
 
-Lightweight desktop widgets for Windows 11. It's native C++ (Win32 + Direct2D), ships as one ~530 KB `.exe`, and needs no installer or runtime.
+Lightweight desktop widgets for Windows 11. It's native C++ (Win32 + Direct2D), ships as one ~580 KB `.exe`, and needs no installer or runtime.
 
 ![Themes](res/themes_preview.png)
 
@@ -72,6 +72,7 @@ On the widget's page in Settings (Widgets → click a widget) there's also a **S
 | To-Do | Fewer rows | 6 rows | More rows when taller, longer text when wider |
 | Media Controls | Compact: small art and buttons | Art on the left | **Album card** when tall (big art on top), longer titles when wide |
 | System Monitor | List with bars when narrow or tall | Rings in a row | Bigger rings |
+| Weather | Temperature and icon | Current conditions and details | Hourly strip (beside or below), then the 7-day list |
 | Custom widgets | Scale only, since their layout is fixed in the JSON file | | |
 
 To drag widgets at any time without Arrange mode, turn on Settings → General → **Move widgets without Arrange mode**.
@@ -93,6 +94,25 @@ To drag widgets at any time without Arrange mode, turn on Settings → General �
 | Quit | Click *Quit Prism Widgets* in Settings, or use the tray menu → Exit |
 
 Command-line flags: `--hidden` starts without opening Settings. `--arrange` opens Arrange mode. `--startup` is used by Start with Windows.
+
+## Weather widget
+
+Shows the **current weather** where you are (temperature, condition, today's high and low, feels-like, humidity and wind), an **hourly** forecast and a **7-day** forecast. The icons are drawn in colour by the app itself.
+
+* **Data:** [Open-Meteo](https://open-meteo.com), a free service that needs no account or API key. Updates every 30 minutes, after the PC wakes from sleep, and when you click **Refresh**.
+* **Location:** detected automatically by default. This is approximate, based on your internet connection, from geojs.io with ipwho.is as a fallback. To pick any city instead, use **Change location…** (right-click the widget, or Settings → Weather) and type a name. If there are several places with that name, you choose from a list.
+* **Units:** automatic (°F for US region settings, otherwise °C), or set °C / °F yourself.
+* **Offline:** the last forecast is kept on disk and shown with "Updated X min ago". Failed updates retry after 5, 10, 15… minutes.
+* **Resizing:** the layout adapts:
+
+| Size | Shows |
+|---|---|
+| Small | Temperature, icon and high/low |
+| Default | Current conditions plus feels-like, humidity and wind |
+| Wide and short | Current conditions with the hourly forecast beside them |
+| Taller | Adds the hourly strip, then the 7-day list with rain chance and temperature-range bars |
+
+* **Light on resources:** nothing runs until a Weather widget is shown. Each update is one small HTTPS request, about 6 KB, on a short-lived background thread. Updates pause during fullscreen games, and the widget only redraws every 5 minutes or when new data arrives.
 
 ## Media Controls widget
 
@@ -117,18 +137,21 @@ The Media Controls widget shows **what's playing right now**: the album art, tit
 
 The glass is rendered from your actual wallpaper, so the widgets blend into it. Prism Widgets reloads automatically when the wallpaper changes, including slideshow and Spotlight changes. With **Text colour → Automatic**, each widget picks light or dark text based on the wallpaper behind it.
 
-## Why it uses so little RAM
+## Why it uses so little RAM (and still feels instant)
 
 * The app is native code with no browser engine, .NET or Electron, and it's statically linked.
 * Rendering runs on the CPU only, through a Direct2D software target. This means no GPU driver or VRAM footprint.
-* The wallpaper is decoded once into a small proxy. Each widget keeps only its own blurred crop, and the proxy is freed after 8 s of idle time.
-* Frame buffers are freed right after they're handed to Windows (DWM).
-* The Settings window and its previews exist only while the window is open. They are released when you close it.
-* The app redraws only when needed: once a minute for the clock (once a second if seconds are shown) and every 2 s for system stats. Nothing runs between updates.
+* **The glass engine is fast**: the wallpaper is blurred at reduced resolution, the panel interior takes a cheap path, and the edge effects use lookup tables. That's about **7× faster** than v1.5 (41 → 6 ms per redraw on average), with identical output.
+* **Dragging moves the finished picture**, so the window just slides at your display's refresh rate. The glass is re-drawn when the mouse rests or when you let go.
+* **Resizing redraws at most once per display frame**, and only the newest size.
+* **Text layouts are cached**, so unchanged labels are not re-shaped on every redraw. In Arrange mode, the widget contents are kept so frame and position changes only redraw the glass.
+* The app redraws only when needed: once a minute for the clock, every 2 s for system stats, and when the media state changes. The media session is checked by its own timer, never while drawing.
 * It **pauses completely** during full-screen apps and games, when the screen is off and when the PC is locked.
-* The process runs at below-normal priority with EcoQoS (efficiency mode) and low memory priority, and it trims its working set when idle.
-
-The expected footprint is about **5–15 MB** in Task Manager with the default three widgets.
+* **Power mode switches automatically**:
+  * When you're using a widget, Settings or Arrange mode, it runs at full speed, so clicks react instantly. Buttons also highlight the moment you press.
+  * 3 seconds after you stop, it returns to **efficiency mode** (below-normal priority + Windows EcoQoS).
+* **Memory goes back to Windows after 10 idle minutes.** The app doesn't trim itself after every redraw, which used to make the next click slow.
+* **Settings → Performance** shows live numbers: memory, CPU, redraw time, click response, drag smoothness and the current power mode.
 
 ## Custom widgets
 
@@ -207,7 +230,8 @@ Source layout:
 | `src/arrange.cpp` | Arrange mode: the edit layer, grid, guides, spacing, keyboard and toolbar |
 | `src/settings.cpp` | The Settings window, custom-drawn with Direct2D and freed when closed |
 | `src/glass.cpp` | Wallpaper proxy and the software glass renderer (blur, refraction, rim light, shadow) |
-| `src/widgets.cpp` | Clock, Calendar, To-Do, Media Controls, System Monitor, custom JSON widgets and samples |
+| `src/widgets.cpp` | Clock, Weather, Calendar, To-Do, Media Controls, System Monitor, custom JSON widgets and samples |
+| `src/weather.cpp` | Weather service: WinHTTP worker, Open-Meteo forecast, location detection and city search, disk cache |
 | `src/media.cpp` | The Windows media session ("now playing"), accessed through the WinRT interfaces directly |
 | `src/util.cpp`, `src/json.cpp` | Helpers, variables and the JSON parser |
 
