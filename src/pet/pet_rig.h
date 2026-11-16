@@ -43,6 +43,12 @@ struct Fk { V2 sh, shF, shB, hipF, hipB, head, eF, hF, eB, hB, kF, fF, kB, fB; }
 
 Pose Stand(const Stage& s);       // standing, facing the user
 Pose StandSide(const Stage& s);   // standing, side-on
+void ToStand(Pose& p, const Stage& s);       // sets only the standing joints and height; keeps x, face, eyes, mouth
+void ToStandSide(Pose& p, const Stage& s);
+Pose LerpPose(const Pose& a, const Pose& b, float u);   // numeric fields only; face, eyes and mouth come from b
+
+enum class Ease : uint8_t { Lin, InOut, Out, In };
+float Eased(Ease e, float u);
 V2 ShoulderOf(const Pose& p, Side side);
 V2 HipOf(const Pose& p, Side side);
 Fk Kinematics(const Pose& p);     // joint positions in local units

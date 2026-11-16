@@ -61,7 +61,7 @@ Ink MakeInk(const Theme& t, float lum) {
     k.accentText = D2D1_COLOR_F{ k.accent.r + (b.r - k.accent.r) * mix, k.accent.g + (b.g - k.accent.g) * mix, k.accent.b + (b.b - k.accent.b) * mix, 1 };
     return k;
 }
-static bool Paused() {
+bool Paused() {
     if (g_arranging) return false;   // our own full-screen overlay must not count as a "fullscreen app"
     if (g_sessionLocked || g_displayOff) return true;
     QUERY_USER_NOTIFICATION_STATE q;
@@ -1165,6 +1165,8 @@ static void ShowTrayMenu() {
     AppendMenuW(xm, MF_STRING | (g_textMode == L"light" ? MF_CHECKED : 0), 1171, L"Light text");
     AppendMenuW(xm, MF_STRING | (g_textMode == L"dark" ? MF_CHECKED : 0), 1172, L"Dark text");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)xm, L"Text colour");
+    AppendMenuW(m, MF_STRING | (PetConfig().enabled ? MF_CHECKED : 0), 1400, L"Show pet");
+    AppendMenuW(m, MF_STRING, 1401, L"Pet settings…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 1180, g_arranging ? L"Finish arranging" : L"Arrange widgets\u2026");
     AppendMenuW(m, MF_STRING, 1181, L"Reset widget positions");
@@ -1193,6 +1195,8 @@ static void ShowTrayMenu() {
     else if (id == 1300) CreateNewWidget();
     else if (id == 1301) ShellExecuteW(nullptr, L"open", CustomWidgetDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     else if (id == 1302) ReloadCustom();
+    else if (id == 1400) { PetConfig().enabled = !PetConfig().enabled; PetApplySettings(); }
+    else if (id == 1401) { OpenPetSettings(); return; }
     SettingsRefresh(true);
 }
 
@@ -1279,9 +1283,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_DISPLAYCHANGE: EndArrange(); SetTimer(h, T_WALLRELOAD, 1000, nullptr); return 0;
     case WM_TIMECHANGE: Widget_RenderAll(false); return 0;
     case WM_WTSSESSION_CHANGE:
-        if (wp == WTS_SESSION_LOCK) g_sessionLocked = true;
-        else if (wp == WTS_SESSION_UNLOCK) { g_sessionLocked = false; SetTimer(h, T_TICK, 200, nullptr); }
+        if (wp == WTS_SESSION_LOCK) { g_sessionLocked = true; PetOnSession(PetSession::Lock); }
+        else if (wp == WTS_SESSION_UNLOCK) { g_sessionLocked = false; SetTimer(h, T_TICK, 200, nullptr); PetOnSession(PetSession::Unlock); }
         return 0;
+    case WM_QUERYENDSESSION: PetOnSession(PetSession::EndSession); return TRUE;   // never block shutdown
+    case WM_ENDSESSION: if (wp) PetOnSession(PetSession::EndSession); return 0;
     case WM_POWERBROADCAST:
         if (wp == PBT_POWERSETTINGCHANGE) {
             auto* ps = (POWERBROADCAST_SETTING*)lp;
@@ -1289,7 +1295,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 g_displayOff = *(DWORD*)ps->Data == 0;
                 if (!g_displayOff) SetTimer(h, T_TICK, 200, nullptr);
             }
-        } else if (wp == PBT_APMRESUMEAUTOMATIC) { Widget_RenderAll(false); SetTimer(h, WEATHER_TIMER_ID, 15000, nullptr); }   // fresh weather after sleep
+        } else if (wp == PBT_APMSUSPEND) PetOnSession(PetSession::Suspend);
+        else if (wp == PBT_APMRESUMEAUTOMATIC) { Widget_RenderAll(false); SetTimer(h, WEATHER_TIMER_ID, 15000, nullptr); PetOnSession(PetSession::Resume); }   // fresh weather after sleep
         return TRUE;
     case WM_DESTROY:
         CloseDayPopup();
@@ -1358,7 +1365,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     LoadTodos();
     g_wallSig = g_wall.Signature();
     BuildWidgets();
-    PetInit();
+    PetInit(startup);
     if (g_firstRun) SaveConfigNow(); else RequestSave();   // persist any clamping / migrated anchors
     bool showWelcome = g_firstRun;
     g_firstRun = false;   // custom widgets added from now on start enabled
@@ -1375,11 +1382,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
 
     MSG msg;
     for (;;) {
-        DWORD n = g_dirWatch != INVALID_HANDLE_VALUE ? 1 : 0;
-        DWORD r = MsgWaitForMultipleObjectsEx(n, &g_dirWatch, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        if (n && r == WAIT_OBJECT_0) {
-            SetTimer(g_main, T_RELOAD_CUSTOM, 400, nullptr);   // debounce editor saves
-            FindNextChangeNotification(g_dirWatch);
+        HANDLE hs[8]; DWORD n = 0;
+        if (g_dirWatch != INVALID_HANDLE_VALUE) hs[n++] = g_dirWatch;
+        n += PetWaitHandles(hs + n, 8 - n);   // pet frame timer and watched processes
+        DWORD r = MsgWaitForMultipleObjectsEx(n, hs, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (r < WAIT_OBJECT_0 + n) {
+            HANDLE h = hs[r - WAIT_OBJECT_0];
+            if (h == g_dirWatch) {
+                SetTimer(g_main, T_RELOAD_CUSTOM, 400, nullptr);   // debounce editor saves
+                FindNextChangeNotification(g_dirWatch);
+            } else PetOnHandle(h);
             continue;
         }
         bool quit = false;

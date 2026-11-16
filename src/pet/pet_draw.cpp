@@ -28,14 +28,21 @@ Expr VisorExpr(Eyes eyes, Mouth mouth, bool blink) {
     return Expr::Open;
 }
 
-static float Lerp(float a, float b, float u) { return a + (b - a) * u; }
-static D2D1_COLOR_F Hex(uint32_t c, float a = 1) { return { ((c >> 16) & 255) / 255.f, ((c >> 8) & 255) / 255.f, (c & 255) / 255.f, a }; }
 
 // ---------------------------------------------------------------- cached D2D resources
-static ID2D1PathGeometry *g_laughMouth = nullptr, *g_angryCut[2] = {};
+static ID2D1PathGeometry *g_laughMouth = nullptr, *g_angryCut[2] = {}, *g_potBody = nullptr, *g_star = nullptr, *g_wedge = nullptr;
+static float g_wedgeKey = -1;
+
+// Head bitmaps: the helmet, visor, discs and eyes are about half the robot's shapes but change only with
+// the expression, view and gaze, so they are drawn once per state and then blitted. A few states are kept.
+struct HeadBmp { ID2D1Bitmap* bmp = nullptr; const void* rt = nullptr; uint32_t key[6] = {}; float cx = 0, cy = 0; unsigned used = 0; };
+static HeadBmp g_heads[6];
+static unsigned g_headTick = 0;
+static void ReleaseHeads() { for (auto& h : g_heads) { SafeRelease(h.bmp); h = HeadBmp{}; } }
 
 void ReleaseDrawCache() {
-    SafeRelease(g_laughMouth); SafeRelease(g_angryCut[0]); SafeRelease(g_angryCut[1]);
+    ReleaseHeads();
+    SafeRelease(g_laughMouth); SafeRelease(g_angryCut[0]); SafeRelease(g_angryCut[1]); SafeRelease(g_potBody); SafeRelease(g_star); SafeRelease(g_wedge); g_wedgeKey = -1;
 }
 
 static ID2D1PathGeometry* Polygon(const D2D1_POINT_2F* pts, int n) {
@@ -63,6 +70,13 @@ static void EnsureGeometry() {
     const D2D1_POINT_2F cutL[3] = { { -8, -9 }, { 8, -9 }, { 8, -1 } }, cutR[3] = { { -8, -9 }, { 8, -9 }, { -8, -1 } };
     if (!g_angryCut[0]) g_angryCut[0] = Polygon(cutL, 3);
     if (!g_angryCut[1]) g_angryCut[1] = Polygon(cutR, 3);
+    const D2D1_POINT_2F pot[4] = { { -9, 0 }, { 9, 0 }, { 6.5f, 15 }, { -6.5f, 15 } };
+    if (!g_potBody) g_potBody = Polygon(pot, 4);
+    if (!g_star) {
+        D2D1_POINT_2F st[10];
+        for (int j = 0; j < 10; j++) { float r = j % 2 ? 2.4f : 6, b = j * PI / 5 - PI / 2; st[j] = { std::cos(b) * r, std::sin(b) * r }; }
+        g_star = Polygon(st, 10);
+    }
 }
 
 // ---------------------------------------------------------------- canvas-style helpers
@@ -86,23 +100,38 @@ struct Canvas {
 
     ID2D1SolidColorBrush* B(D2D1_COLOR_F c) { br->SetColor(c); return br; }
     // Filled rounded rect with an optional outline (lw > 0), like the prototype's shape().
+    // Outlined shapes: the outline is a slightly larger fill underneath, not a stroke. Same look as
+    // fill + centred stroke, and fills cost about half as much as strokes on the software target.
     void RR(float x, float y, float w, float h, float r, D2D1_COLOR_F fill, float lw = 0) {
         r = std::min(r, std::min(w, h) / 2);   // the canvas shrinks radii that don't fit; D2D would turn it into an ellipse
-        D2D1_ROUNDED_RECT rr{ { x, y, x + w, y + h }, r, r };
-        rt->FillRoundedRectangle(&rr, B(fill));
-        if (lw > 0) rt->DrawRoundedRectangle(&rr, B(Hex(pal.line)), lw);
+        float o = lw / 2;
+        if (lw > 0) {
+            D2D1_ROUNDED_RECT out{ { x - o, y - o, x + w + o, y + h + o }, r + o, r + o };
+            rt->FillRoundedRectangle(&out, B(Hex(pal.line)));
+        }
+        float ri = std::max(0.f, r - o);
+        D2D1_ROUNDED_RECT in{ { x + o, y + o, x + w - o, y + h - o }, ri, ri };
+        rt->FillRoundedRectangle(&in, B(fill));
     }
     void Ellipse(float cx, float cy, float rx, float ry, D2D1_COLOR_F fill, float lw = 0) {
-        D2D1_ELLIPSE e{ { cx, cy }, rx, ry };
-        rt->FillEllipse(&e, B(fill));
-        if (lw > 0) rt->DrawEllipse(&e, B(Hex(pal.line)), lw);
+        float o = lw / 2;
+        if (lw > 0) { D2D1_ELLIPSE out{ { cx, cy }, rx + o, ry + o }; rt->FillEllipse(&out, B(Hex(pal.line))); }
+        D2D1_ELLIPSE in{ { cx, cy }, rx - o, ry - o };
+        rt->FillEllipse(&in, B(fill));
     }
     void Line(V2 a, V2 b, D2D1_COLOR_F c, float w) { rt->DrawLine({ a.x, a.y }, { b.x, b.y }, B(c), w, round); }
     // Thick round-capped limb with an outline: the outline colour slightly wider underneath.
+    // One stroked two-segment path per pass: cheaper than four round-capped lines on the software target.
     void Limb(V2 a, V2 b, V2 c, float w, D2D1_COLOR_F col) {
         D2D1_COLOR_F ln = Hex(pal.line);
-        Line(a, b, ln, w + 4.2f); Line(b, c, ln, w + 4.2f);
-        Line(a, b, col, w); Line(b, c, col, w);
+        ID2D1PathGeometry* g = nullptr; ID2D1GeometrySink* s = nullptr;
+        if (SUCCEEDED(g_gr.d2d->CreatePathGeometry(&g)) && SUCCEEDED(g->Open(&s))) {
+            s->BeginFigure({ a.x, a.y }, D2D1_FIGURE_BEGIN_HOLLOW);
+            D2D1_POINT_2F pts[2] = { { b.x, b.y }, { c.x, c.y } };
+            s->AddLines(pts, 2); s->EndFigure(D2D1_FIGURE_END_OPEN); s->Close(); s->Release();
+            rt->DrawGeometry(g, B(ln), w + 4.2f, round); rt->DrawGeometry(g, B(col), w, round);
+        }
+        SafeRelease(g);
     }
     void Quad(V2 p0, V2 p1, V2 p2, D2D1_COLOR_F c, float w) {   // quadratic curve as short round-capped segments
         V2 prev = p0;
@@ -115,9 +144,9 @@ struct Canvas {
     // Stand-in for the canvas shadowBlur: a soft halo of stacked faint ellipses behind a glowing part.
     // A radial gradient brush looks smoother but costs about 2 MB on the software target.
     void Glow(float cx, float cy, float rx, float ry) {
-        for (float f : { 1.f, .8f, .62f, .46f }) {
+        for (float f : { 1.f, .72f, .48f }) {
             D2D1_ELLIPSE e{ { cx, cy }, rx * f, ry * f };
-            rt->FillEllipse(&e, B(Alpha(glow, .11f)));
+            rt->FillEllipse(&e, B(Alpha(glow, .14f)));
         }
     }
     void Pill(float x, float y, float w, float h, D2D1_COLOR_F c) { RR(x - w / 2, y - h / 2, w, h, w / 2, c); }
@@ -185,8 +214,8 @@ static void Head(Canvas& c, float v, Expr expr, float gy) {
     c.RR(vx - vw / 2, -15, vw, 30, 12, Hex(c.pal.visor));
     {   // visor highlight: arc around (vx-6, -30), r 30, from .25pi to .62pi (inside the visor, so no clip needed)
         V2 prev{ vx - 6 + 30 * std::cos(.25f * PI), -30 + 30 * std::sin(.25f * PI) };
-        for (int i = 1; i <= 8; i++) {
-            float a = (.25f + .37f * i / 8) * PI;
+        for (int i = 1; i <= 5; i++) {
+            float a = (.25f + .37f * i / 5) * PI;
             V2 q{ vx - 6 + 30 * std::cos(a), -30 + 30 * std::sin(a) };
             c.Line(prev, q, D2D1_COLOR_F{ 1, 1, 1, .10f }, 3); prev = q;
         }
@@ -198,7 +227,45 @@ static void Head(Canvas& c, float v, Expr expr, float gy) {
     c.Set(keep);
 }
 
-void DrawRobot(ID2D1RenderTarget* rt, const Pose& p, float scale, const Palette& pal, D2D1_COLOR_F glow, Expr expr) {
+// ---------------------------------------------------------------- props
+// Laptop on the lap: an 18-unit base and lid hinged at its far end; it rises from behind the floor line.
+static void DrawLaptop(Canvas& c, const D2D1_MATRIX_3X2_F& screen, const Laptop& L, float floorY, float time) {
+    D2D1_MATRIX_3X2_F keep = c.m;
+    c.Set(screen);
+    D2D1_RECT_F clip{ -1e6f, -1e6f, 1e6f, floorY };
+    c.rt->PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    c.Set(keep);
+    c.RR(L.x, L.y - 3, 18, 3, 1.2f, Hex(0x3e4554), 1.2f);
+    V2 hg{ L.x + 18, L.y - 3 }, e{ hg.x - 18 * std::cos(L.lid), hg.y - 18 * std::sin(L.lid) };
+    c.Line(hg, e, Hex(0x2b313d), 3.2f);
+    if (L.lid > .6f) {   // the screen's glow on the inside of the lid
+        float nx = -std::sin(L.lid), ny = std::cos(L.lid), flick = .75f + .2f * (.5f + .5f * std::sin(time * 37));
+        c.Line({ hg.x + nx * 1.8f, hg.y + ny * 1.8f }, { e.x + nx * 1.8f, e.y + ny * 1.8f }, D2D1_COLOR_F{ .51f, .80f, 1, flick }, 1.6f);
+        float key = L.lid + L.x * 100 + L.y * 1e4f;   // the light wedge is rebuilt only while the laptop moves
+        if (g_wedgeKey != key) {
+            SafeRelease(g_wedge);
+            D2D1_POINT_2F wedge[4] = { { hg.x, hg.y }, { e.x, e.y }, { e.x - 14, e.y + 6 }, { hg.x - 16, hg.y } };
+            g_wedge = Polygon(wedge, 4); g_wedgeKey = key;
+        }
+        if (g_wedge) c.rt->FillGeometry(g_wedge, c.B(D2D1_COLOR_F{ .51f, .80f, 1, .10f }));
+    }
+    c.rt->PopAxisAlignedClip();
+}
+static void DrawPhone(Canvas& c, const Phone& ph, V2 hand) {
+    D2D1_MATRIX_3X2_F keep = c.m;
+    c.Translate(hand.x + 1, hand.y - 4); c.Rotate(.35f);
+    c.RR(-4, -7, 8, 13, 2, Hex(0x20242e));
+    D2D1_RECT_F scr{ -3, -6, 3, 5 };
+    c.rt->FillRectangle(&scr, c.B(Hex(0x8fd0ff)));
+    for (int i = -1; i < 5; i++) {   // content lines scrolling past, kept inside the screen
+        float yy = -6 + std::fmod(std::fmod(i * 4 + ph.off, 16.f) + 16, 16.f) - 2;
+        D2D1_RECT_F ln{ -2.2f, std::max(yy, -6.f), 2.2f, std::min(yy + 1.4f, 5.f) };
+        if (ln.bottom > ln.top) c.rt->FillRectangle(&ln, c.B(D2D1_COLOR_F{ 30 / 255.f, 60 / 255.f, 110 / 255.f, .55f }));
+    }
+    c.Set(keep);
+}
+
+void DrawRobot(ID2D1RenderTarget* rt, const Pose& p, float scale, const Palette& pal, D2D1_COLOR_F glow, Expr expr, const World* w) {
     EnsureGeometry();
     Canvas c{ rt, g_gr.br, g_gr.round, pal, glow, {} };
     rt->GetTransform(&c.m);
@@ -239,8 +306,45 @@ void DrawRobot(ID2D1RenderTarget* rt, const Pose& p, float scale, const Palette&
     };
     auto head = [&]() {
         D2D1_MATRIX_3X2_F keep = c.m;
-        c.Translate(k.head.x, k.head.y); c.Rotate(p.t + p.h); c.Scale(.9f, .9f);
-        Head(c, 1 - v, expr, p.gy);
+        c.Translate(k.head.x, k.head.y); c.Rotate(p.t + p.h);
+        if (!w) { c.Scale(.9f, .9f); Head(c, 1 - v, expr, p.gy); c.Set(keep); return; }   // previews draw it directly
+        float hs = .9f * scale;   // head px per local unit
+        uint32_t key[6] = { (uint32_t)std::lround(hs * 1000), (uint32_t)std::lround((1 - v) * 20), (uint32_t)expr,
+                            (uint32_t)std::lround(p.gy * 4 + 100), (uint32_t)(uintptr_t)&pal,
+                            (uint32_t)(glow.r * 255) | (uint32_t)(glow.g * 255) << 8 | (uint32_t)(glow.b * 255) << 16 };
+        HeadBmp* hb = nullptr;
+        for (auto& h : g_heads) if (h.bmp && h.rt == rt && !memcmp(h.key, key, sizeof key)) hb = &h;
+        if (!hb) {   // draw this state once into a bitmap
+            hb = &g_heads[0];
+            for (auto& h : g_heads) if (h.used < hb->used) hb = &h;
+            SafeRelease(hb->bmp);
+            float qv = key[1] / 20.f, qgy = ((int)key[3] - 100) / 4.f;
+            hb->cx = std::ceil(44 * hs) + 2; hb->cy = std::ceil(34 * hs) + 2;
+            D2D1_SIZE_F sz{ 2 * hb->cx, 2 * hb->cy };
+            ID2D1BitmapRenderTarget* brt = nullptr;
+            D2D1_PIXEL_FORMAT pf{ DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
+            if (SUCCEEDED(rt->CreateCompatibleRenderTarget(&sz, nullptr, &pf, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, &brt))) {
+                ID2D1SolidColorBrush* bb = nullptr; D2D1_COLOR_F white{ 1, 1, 1, 1 };
+                brt->CreateSolidColorBrush(&white, nullptr, &bb);
+                if (bb) {
+                    brt->BeginDraw();
+                    D2D1_COLOR_F clear{ 0, 0, 0, 0 }; brt->Clear(&clear);
+                    Canvas hc{ brt, bb, c.round, pal, glow, { hs, 0, 0, hs, hb->cx, hb->cy } };
+                    brt->SetTransform(&hc.m);
+                    Head(hc, qv, expr, qgy);
+                    if (SUCCEEDED(brt->EndDraw())) brt->GetBitmap(&hb->bmp);
+                    bb->Release();
+                }
+                brt->Release();
+            }
+            hb->rt = rt; memcpy(hb->key, key, sizeof key);
+        }
+        hb->used = ++g_headTick;
+        if (hb->bmp) {
+            c.Scale(1 / scale, 1 / scale);   // back to px, the bitmap's own units
+            D2D1_RECT_F d{ -hb->cx, -hb->cy, hb->cx, hb->cy };
+            rt->DrawBitmap(hb->bmp, &d, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, nullptr);
+        }
         c.Set(keep);
     };
 
@@ -254,9 +358,143 @@ void DrawRobot(ID2D1RenderTarget* rt, const Pose& p, float scale, const Palette&
     if (upB) arm(B);
     if (upF) arm(F);
     head();
+    if (w && w->laptop) DrawLaptop(c, base, w->lap, w->st.floor, w->time);
+    if (w && w->phone) DrawPhone(c, w->ph, k.hB);
     if (v > .5f && !upB) arm(B);
+    if (w && w->pot != Pot::None) {
+        V2 at = w->pot == Pot::HandB ? V2{ k.hB.x, k.hB.y - 6 } : V2{ (k.hF.x + k.hB.x) / 2, (k.hF.y + k.hB.y) / 2 - 6 };
+        D2D1_MATRIX_3X2_F keep = c.m;
+        c.Translate(at.x, at.y);
+        DrawPotShape(rt);
+        c.Set(keep);
+    }
     if (!upF) arm(F);
     c.Set(base);
+}
+
+}  // namespace pet
+
+namespace pet {
+
+// Multiplies `local` onto the target's current transform (row vectors: local applies first).
+static D2D1_MATRIX_3X2_F On(const D2D1_MATRIX_3X2_F& l, const D2D1_MATRIX_3X2_F& m) {
+    return { l._11 * m._11 + l._12 * m._21, l._11 * m._12 + l._12 * m._22,
+             l._21 * m._11 + l._22 * m._21, l._21 * m._12 + l._22 * m._22,
+             l._31 * m._11 + l._32 * m._21 + m._31, l._31 * m._12 + l._32 * m._22 + m._32 };
+}
+
+void DrawPotShape(ID2D1RenderTarget* rt) {
+    EnsureGeometry();
+    ID2D1SolidColorBrush* br = g_gr.br;
+    D2D1_MATRIX_3X2_F m; rt->GetTransform(&m);
+    for (float a : { -.6f, 0.f, .6f }) {   // leaves: translate(0, -2), rotate(a)
+        float l = a == 0 ? 16.f : 13.f, c = std::cos(a), s = std::sin(a);
+        D2D1_MATRIX_3X2_F n = On({ c, s, -s, c, 0, -2 }, m);
+        rt->SetTransform(&n);
+        D2D1_ELLIPSE e{ { 0, -l / 2 }, 3.2f, l / 2 };
+        br->SetColor(Hex(0x4f8a3a)); rt->FillEllipse(&e, br);
+    }
+    rt->SetTransform(&m);
+    D2D1_ELLIPSE fl{ { 0, -17 }, 3.6f, 3.6f }, fc{ { 0, -17 }, 1.5f, 1.5f };
+    br->SetColor(Hex(0xff7aa8)); rt->FillEllipse(&fl, br);
+    br->SetColor(Hex(0xffe07a)); rt->FillEllipse(&fc, br);
+    if (g_potBody) { br->SetColor(Hex(0xc56a3d)); rt->FillGeometry(g_potBody, br); br->SetColor(Hex(0x7d3c1e)); rt->DrawGeometry(g_potBody, br, 1.2f); }
+    D2D1_ROUNDED_RECT rim{ { -10.5f, -2.5f, 10.5f, 2.5f }, 1.5f, 1.5f };
+    br->SetColor(Hex(0xd47a4b)); rt->FillRoundedRectangle(&rim, br);
+    br->SetColor(Hex(0x7d3c1e)); rt->DrawRoundedRectangle(&rim, br, 1.2f);
+}
+
+// Text and "z" bubbles use one cached format and are scaled with the transform.
+static void Label(ID2D1RenderTarget* rt, const wchar_t* s, float x, float y, float size, D2D1_COLOR_F col, float alpha) {
+    IDWriteTextFormat* f = g_gr.Format(FONT_TEXT, 16, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    if (!f || !s) return;
+    D2D1_MATRIX_3X2_F m; rt->GetTransform(&m);
+    float k = size / 16;
+    D2D1_MATRIX_3X2_F n = On({ k, 0, 0, k, x, y }, m);
+    rt->SetTransform(&n);
+    UINT32 len = (UINT32)wcslen(s);
+    D2D1_RECT_F r{ 0, -18, 200, 6 };   // baseline near y
+    ID2D1SolidColorBrush* br = g_gr.br;
+    br->SetColor(D2D1_COLOR_F{ 15 / 255.f, 18 / 255.f, 28 / 255.f, .6f * alpha });
+    for (V2 o : { V2{ -1.2f, 0 }, V2{ 1.2f, 0 }, V2{ 0, -1.2f }, V2{ 0, 1.2f } }) {   // dark outline
+        D2D1_RECT_F ro{ r.left + o.x, r.top + o.y, r.right + o.x, r.bottom + o.y };
+        rt->DrawText(s, len, f, &ro, br);
+    }
+    br->SetColor(Alpha(col, alpha));
+    rt->DrawText(s, len, f, &r, br);
+    rt->SetTransform(&m);
+}
+
+void DrawParticles(ID2D1RenderTarget* rt, const std::vector<Particle>& parts, float k) {
+    ID2D1SolidColorBrush* br = g_gr.br;
+    D2D1_MATRIX_3X2_F m; rt->GetTransform(&m);
+    for (const Particle& q : parts) {
+        float f = q.life / q.max;
+        switch (q.type) {
+        case Particle::Dust: {
+            D2D1_ELLIPSE e{ { q.x, q.y }, q.size * (.6f + f * 1.4f), q.size * (.6f + f * 1.4f) };
+            br->SetColor(Hex(0xe2d9c8, (1 - f) * .55f)); rt->FillEllipse(&e, br);
+            break;
+        }
+        case Particle::Text: case Particle::Z: {
+            float a = f > .7f ? (1 - f) / .3f : std::min(1.f, f * 8);
+            bool z = q.type == Particle::Z;
+            Label(rt, z ? L"z" : q.text, q.x, q.y, (z ? 12 + f * 10 : 16) * k, z ? Hex(0xdfe6ff) : Hex(q.col), a);
+            break;
+        }
+        default: {   // shard, soil, leaf: spin, fade near the end
+            float a = f > .75f ? (1 - f) / .25f : 1;
+            float c = std::cos(q.rot), s = std::sin(q.rot);
+            D2D1_MATRIX_3X2_F n = On({ c * k, s * k, -s * k, c * k, q.x, q.y }, m);
+            rt->SetTransform(&n);
+            if (q.type == Particle::Shard && q.geo) {
+                br->SetColor(Hex(0xc56a3d, a)); rt->FillGeometry(q.geo, br);
+                br->SetColor(Hex(0x7d3c1e, a)); rt->DrawGeometry(q.geo, br, 1.2f);
+            } else if (q.type == Particle::Soil) {
+                D2D1_ELLIPSE e{ { 0, 0 }, q.size, q.size }; br->SetColor(Hex(0x5b3d26, a)); rt->FillEllipse(&e, br);
+            } else if (q.type == Particle::Leaf) {
+                D2D1_ELLIPSE e{ { 0, 0 }, q.size * .3f, q.size }; br->SetColor(Hex(0x4f8a3a, a)); rt->FillEllipse(&e, br);
+            }
+            rt->SetTransform(&m);
+        }
+        }
+    }
+}
+
+// The bed: a mattress with a pillow at its head end, sliding down behind the floor line.
+static void DrawBed(ID2D1RenderTarget* rt, const Bed& b, float s, float k) {
+    D2D1_RECT_F clip{ -1e6f, -1e6f, 1e6f, b.floor };
+    rt->PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    ID2D1SolidColorBrush* br = g_gr.br;
+    float len = 123 * s, th = 10 * s, x = b.x, y = b.floor + b.dy;
+    D2D1_ROUNDED_RECT mt{ { x, y - th, x + len, y }, 4 * s, 4 * s };
+    br->SetColor(Hex(0xe8e3f4)); rt->FillRoundedRectangle(&mt, br);
+    br->SetColor(Hex(0xa79ec4)); rt->DrawRoundedRectangle(&mt, br, 1.5f * k);
+    br->SetColor(D2D1_COLOR_F{ 150 / 255.f, 140 / 255.f, 190 / 255.f, .5f });
+    for (int i = 1; i < 6; i++) rt->DrawLine({ x + i * len / 6, y - th + 2 * k }, { x + i * len / 6, y - 2 * k }, br, 1 * k);
+    float px = b.dir > 0 ? x + 3 * s : x + len - 29 * s;
+    D2D1_ROUNDED_RECT pw{ { px, y - th - 7 * s, px + 26 * s, y - th + 1 * s }, 4 * s, 4 * s };
+    br->SetColor(Hex(0xffffff)); rt->FillRoundedRectangle(&pw, br);
+    br->SetColor(Hex(0xbdb5d6)); rt->DrawRoundedRectangle(&pw, br, 1.5f * k);
+    rt->PopAxisAlignedClip();
+}
+
+void DrawPet(ID2D1RenderTarget* rt, const World& w, const Pose& p, Expr expr) {
+    float k = w.st.scale / 1.25f;
+    if (w.bed) DrawBed(rt, w.bd, w.st.scale, k);
+    DrawRobot(rt, p, w.st.scale, *w.pal, w.glow, expr, &w);
+    DrawParticles(rt, w.parts, k);
+    if (w.time <= w.dizzyUntil && g_star) {   // dizzy stars circling the helmet
+        V2 hd = ToWorld(p, Kinematics(p).head, w.st.scale);
+        D2D1_MATRIX_3X2_F m; rt->GetTransform(&m);
+        for (int i = 0; i < 3; i++) {
+            float a = w.time * 5 + i * 2.09f, x = hd.x + std::cos(a) * 20 * k, y = hd.y - 22 * k + std::sin(a) * 6 * k;
+            D2D1_MATRIX_3X2_F n = On({ k, 0, 0, k, x, y }, m);
+            rt->SetTransform(&n);
+            g_gr.br->SetColor(Hex(0xffd84a)); rt->FillGeometry(g_star, g_gr.br);
+        }
+        rt->SetTransform(&m);
+    }
 }
 
 }  // namespace pet

@@ -1,9 +1,37 @@
-// Prism Pet - the desktop pet's public API, used by app.cpp and arrange.cpp.
+// Prism Pet - the desktop pet's public API, used by app.cpp, arrange.cpp and settings.cpp.
 #pragma once
 #include "../common.h"
 
+struct PetSettings {
+    bool enabled = true;
+    std::wstring theme = L"pearl";     // pearl | graphite | sand
+    std::wstring glow = L"theme";      // theme | accent
+    float size = .85f;                 // 0.6 - 1.5
+    int mischiefMinutes = 30;          // flower pot / cursor grab interval (active time)
+    bool pacing = true;
+    int pacingMinutes = 5;             // standing still before pacing
+    float pacingRange = 1 / 3.f;       // fraction of the screen width
+    bool collision = false;            // the cursor can bump the pet
+    std::vector<std::wstring> codingApps, browserApps;   // process file names
+};
+PetSettings& PetConfig();
+void PetApplySettings();               // after changing PetConfig(): show/hide, redraw, save
+void PetResetPosition();
+
 void PetLoadSettings(const JVal* j);   // the "pet" object in config.json (may be null)
 void PetSaveSettings(JVal& j);
-void PetInit();                        // after LoadConfig: shows the pet if it is enabled
+void PetInit(bool atLogin);            // after LoadConfig; atLogin: start asleep in bed and wake up
 void PetShutdown();
 void PetArrange(bool on);              // Arrange mode: the pet hides while it runs
+
+enum class PetSession { Lock, Unlock, Suspend, Resume, EndSession };
+void PetOnSession(PetSession e);
+
+// Main loop: extra handles to wait on (frame timer, watched processes) and their dispatch.
+int  PetWaitHandles(HANDLE* out, int max);
+void PetOnHandle(HANDLE h);
+
+// Settings window
+void PetDrawPreview(ID2D1RenderTarget* rt, float cx, float floorY, float scale);
+struct PetStats { double renderMs = 0; int fps = 0; bool visible = false, hook = false; };
+PetStats PetGetStats();

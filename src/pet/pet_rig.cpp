@@ -23,6 +23,32 @@ Pose StandSide(const Stage& s) {
     return p;
 }
 
+void ToStand(Pose& p, const Stage& s) {
+    Pose q = Stand(s);
+    q.x = p.x; q.face = p.face; q.eyes = p.eyes; q.mouth = p.mouth;
+    p = q;
+}
+void ToStandSide(Pose& p, const Stage& s) {
+    Pose q = StandSide(s);
+    q.x = p.x; q.face = p.face; q.eyes = p.eyes; q.mouth = p.mouth;
+    p = q;
+}
+Pose LerpPose(const Pose& a, const Pose& b, float u) {
+    Pose r = b;
+    float Pose::*f[] = { &Pose::x, &Pose::y, &Pose::rot, &Pose::t, &Pose::h, &Pose::v, &Pose::gy, &Pose::aF1, &Pose::aF2,
+                         &Pose::aB1, &Pose::aB2, &Pose::lF1, &Pose::lF2, &Pose::lB1, &Pose::lB2 };
+    for (auto m : f) r.*m = Lerp(a.*m, b.*m, u);
+    return r;
+}
+float Eased(Ease e, float u) {
+    switch (e) {
+    case Ease::InOut: return u < .5f ? 2 * u * u : 1 - std::pow(-2 * u + 2, 2.f) / 2;
+    case Ease::Out: return 1 - std::pow(1 - u, 3.f);
+    case Ease::In: return u * u * u;
+    default: return u;
+    }
+}
+
 V2 ShoulderOf(const Pose& p, Side side) { return Rot({ (side == F ? SHX : -SHX) * p.v, -L_TORSO + 2 * p.v }, p.t); }
 V2 HipOf(const Pose& p, Side side) { return { (side == F ? HPX : -HPX) * p.v + (side == F ? 2.f : -2.f) * (1 - p.v), 0 }; }
 
