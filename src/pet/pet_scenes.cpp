@@ -937,15 +937,18 @@ static Scene PortalHome() {
 Scene SceneGoHome() {
     Scene s;
     s.push_back(Fps(30));
-    if (!OnHomeScreen()) {
-        if (C.portalHome) Append(s, PortalHome());
-        else s.push_back(Act([] { AdoptThisScreen(); }));   // this screen's bottom-right becomes home
-    }
-    if (OnHomeScreen() || !C.portalHome) {
-        if (W.st.floor < W.work.bottom - 2) {   // up on an invisible floor: get down to the taskbar first
+    bool other = !OnHomeScreen();
+    if (other && C.portalHome) Append(s, PortalHome());   // back to the home screen
+    else {
+        if (other) s.push_back(Act([] { AdoptThisScreen(); }));   // this screen's bottom-right becomes home
+        float homeX = other ? W.work.right - U(45) : C.homeX;
+        bool up = W.st.floor < W.work.bottom - 2;   // on an invisible floor above the taskbar
+        if (C.wayDown == 4) {   // portal: any trip longer than a short step, short and cheap
+            if (up || std::fabs(homeX - W.p.x) > U(60)) Append(s, PortalHome());
+        } else if (up) {
             switch (C.wayDown) {
-            case 1: Append(s, DropTo((float)W.work.bottom, (C.homeX >= W.p.x ? 1 : -1) * 60.f, true)); break;
-            case 2: s.push_back(WalkPath(FindPath({ W.p.x, W.st.floor }, { C.homeX, (float)W.work.bottom }))); s.push_back(Act([] { W.st.floor = (float)W.work.bottom; })); break;
+            case 1: Append(s, DropTo((float)W.work.bottom, (homeX >= W.p.x ? 1 : -1) * 60.f, true)); break;
+            case 2: s.push_back(WalkPath(FindPath({ W.p.x, W.st.floor }, { homeX, (float)W.work.bottom }))); s.push_back(Act([] { W.st.floor = (float)W.work.bottom; })); break;
             case 3: Append(s, LedgePath()); break;
             default: Append(s, ClimbDown()); break;
             }

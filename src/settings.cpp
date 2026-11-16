@@ -668,8 +668,8 @@ float PagePet(float x0, float x1, float y) {
     y = Group(x0, x1, y, L"Behaviour", beh);
 
     std::vector<RowSpec> way;
-    RowSpec down{ L"Getting down", L"When it was dropped above the taskbar and needs to get home", [&c](D2D1_RECT_F r) {
-        Segmented(r.right, (r.top + r.bottom) / 2, { L"Climb down", L"Jump down", L"Walk across", L"Window ledges" }, c.wayDown, [&c](int i) {
+    RowSpec down{ L"Getting down", L"From above the taskbar. Portal: every trip home goes through a portal (quickest)", [&c](D2D1_RECT_F r) {
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Climb down", L"Jump down", L"Walk across", L"Window ledges", L"Portal" }, c.wayDown, [&c](int i) {
             c.wayDown = i; PetApplySettings(); }); } };
     down.stacked = true; down.h = 104;
     way.push_back(down);

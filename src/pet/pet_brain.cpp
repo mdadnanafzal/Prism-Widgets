@@ -30,6 +30,7 @@ static HANDLE g_timer = nullptr; static int g_timerFps = 0;
 static bool g_arrange = false, g_paused = false;
 static double g_renderMs = 0;
 static RECT g_hit{};
+static V2 g_lastDrawn{};   // pelvis in the last frame, to tell whether the pet is moving
 static Surface g_surf;
 
 // home spot: a corner distance on a named monitor, in DIP (unset = bottom-right of the primary screen)
@@ -218,7 +219,11 @@ static void Render() {
     if (W.portal) { l = std::min(l, W.portalX - U(36)); r = std::max(r, W.portalX + U(36)); t = std::min(t, W.portalFloor - U(90)); b = std::max(b, W.portalFloor + U(4)); }
     if (W.bed) { l = std::min(l, W.bd.x - 4); r = std::max(r, W.bd.x + U(127)); t = std::min(t, W.bd.floor - U(30)); b = std::max(b, W.bd.floor + U(4)); }
     RECT box{ (LONG)std::floor(l), (LONG)std::floor(t), (LONG)std::ceil(r), (LONG)std::ceil(b) };
-    bool fast = g_dragging || W.hanging || g_kind == Kind::Phys;   // fast motion: the window follows every frame
+    // Moving (walking, climbing, falling, dragged, a portal): the window follows the pet every frame.
+    // Jumping it in steps showed as a trail. Sitting still, the window stays put, which is cheaper.
+    bool moving = std::fabs(p.x - g_lastDrawn.x) + std::fabs(p.y - g_lastDrawn.y) > .5f || W.portal;
+    g_lastDrawn = { p.x, p.y };
+    bool fast = moving || g_dragging || W.hanging || g_kind == Kind::Phys;
     Present(g_surf, g_wnd, box, [&](ID2D1RenderTarget* rt) { DrawPet(rt, W, p, e); }, fast);
 
     // Body box for the cursor hook: joints plus the limbs' thickness, the helmet a bit more.
@@ -556,7 +561,7 @@ void PetLoadSettings(const JVal* j) {
     s.collision = j->boolean(L"collision", false);
     s.walkSpeed = Clamp((float)j->num(L"walkSpeed", 1), .5f, 2.f);
     std::wstring wd = j->str(L"wayDown", L"climb");
-    s.wayDown = wd == L"jump" ? 1 : wd == L"screen" ? 2 : wd == L"ledges" ? 3 : 0;
+    s.wayDown = wd == L"jump" ? 1 : wd == L"screen" ? 2 : wd == L"ledges" ? 3 : wd == L"portal" ? 4 : 0;
     s.portalHome = j->str(L"otherScreen", L"portal") != L"adopt";
     auto list = [&](const wchar_t* key, std::vector<std::wstring>& out) {
         const JVal* a = j->get(key);
@@ -590,8 +595,8 @@ void PetSaveSettings(JVal& j) {
     list(L"codingApps", g_set.codingApps);
     list(L"browserApps", g_set.browserApps);
     j.set(L"walkSpeed") = JVal::MakeNum(std::round(g_set.walkSpeed * 100) / 100);
-    const wchar_t* ways[] = { L"climb", L"jump", L"screen", L"ledges" };
-    j.set(L"wayDown") = JVal::MakeStr(ways[Clamp(g_set.wayDown, 0, 3)]);
+    const wchar_t* ways[] = { L"climb", L"jump", L"screen", L"ledges", L"portal" };
+    j.set(L"wayDown") = JVal::MakeStr(ways[Clamp(g_set.wayDown, 0, 4)]);
     j.set(L"otherScreen") = JVal::MakeStr(g_set.portalHome ? L"portal" : L"adopt");
     if (g_homeSet) { JVal& h = j.set(L"home"); h = JVal::MakeObj(); h.set(L"monitor") = JVal::MakeStr(g_homeMon); }
 }

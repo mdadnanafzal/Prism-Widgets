@@ -13,7 +13,7 @@ struct PetSettings {
     float pacingRange = 1 / 3.f;       // fraction of the screen width
     bool collision = false;            // the cursor can bump the pet
     float walkSpeed = 1;               // all walks: .7 slow, 1 normal, 1.4 fast
-    int wayDown = 0;                   // from above the taskbar: 0 climb down, 1 jump down, 2 walk across the screen, 3 window ledges
+    int wayDown = 0;                   // from above the taskbar: 0 climb down, 1 jump down, 2 walk across the screen, 3 window ledges, 4 portal for every trip home
     bool portalHome = true;            // on another screen: portal back to the home screen (false: that screen becomes home)
     std::vector<std::wstring> codingApps, browserApps;   // process file names
 };

@@ -79,7 +79,7 @@ struct SceneCtx {             // where things are, in screen px
     float faceIn = -1;        // facing toward the middle of the screen when sitting at home
     bool reduced = false;     // Windows animation effects are off
     float walkSpeed = 1;      // walk speed setting (all walks)
-    int wayDown = 0;          // from above the taskbar: 0 climb down the screen edge, 1 jump down, 2 walk across the screen, 3 window ledges
+    int wayDown = 0;          // from above the taskbar: 0 climb down the screen edge, 1 jump down, 2 walk across the screen, 3 window ledges, 4 portal
     bool portalHome = true;   // on another screen: go back through a portal (else that screen becomes home)
 };
 extern SceneCtx C;
