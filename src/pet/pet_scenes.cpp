@@ -742,27 +742,24 @@ static Scene DropTo(float floorY, float vx, bool hop) {
 
 // Way down 0: walk to the nearest screen edge and climb down it, hand over hand, to the taskbar.
 static Scene ClimbDown() {
-    float side = W.p.x - W.work.left < W.work.right - W.p.x ? -1.f : 1.f;   // -1: left edge
-    auto open = [](float x) {   // no other screen beyond this edge (else it would climb half on that screen)
-        return MonitorFromPoint(POINT{ (LONG)x, (LONG)(W.st.floor - U(40)) }, MONITOR_DEFAULTTONULL) == nullptr;
-    };
-    bool leftOpen = open(W.work.left - 4.f), rightOpen = open(W.work.right + 4.f);
-    if (side < 0 && !leftOpen && rightOpen) side = 1;
-    else if (side > 0 && !rightOpen && leftOpen) side = -1;
-    float wall = side < 0 ? (float)W.work.left : (float)W.work.right, x = wall - side * U(16);
+    float side = W.p.x - W.work.left < W.work.right - W.p.x ? -1.f : 1.f;   // the nearest edge; -1: left
+    float wall = side < 0 ? (float)W.work.left : (float)W.work.right;
+    // At an edge shared with another screen it climbs a little further in, so its helmet stays on this screen.
+    bool shared = MonitorFromPoint(POINT{ (LONG)(wall + side * 4), (LONG)(W.st.floor - U(40)) }, MONITOR_DEFAULTTONULL) != nullptr;
+    float inset = shared ? 34.f : 16.f, reach = inset - 3, x = wall - side * U(inset);   // reach: hands, in local units
     Scene s;
     s.push_back(Walk([x] { return x; }));
     s.push_back(Tw(TS([side](Pose& q) { q.face = side; }), .2f));
-    s.push_back(Tw([](Pose& q) { q.t = .12f; q.h = -.2f; ArmIK(q, F, { 13, -26 }); ArmIK(q, B, { 12, -22 }); }, .3f));
+    s.push_back(Tw([reach](Pose& q) { q.t = .12f; q.h = -.2f; ArmIK(q, F, { reach, -26 }); ArmIK(q, B, { reach - 1, -22 }); }, .3f));
     Step climb; climb.motion = true;
     climb.begin = [](Step& st) {
         st.f[0] = W.p.y; st.f[1] = (float)W.work.bottom - U(STANDH);
         st.dur = std::max(.3f, (st.f[1] - st.f[0]) / (U(60) * C.walkSpeed)); W.fps = 30; W.idle = false;
     };
-    climb.update = [](Step& st, float u, float, float t) {
+    climb.update = [reach](Step& st, float u, float, float t) {
         Pose& p = W.p; float ph = t * 7 * C.walkSpeed;
         p.y = Lerp(st.f[0], st.f[1], u); p.t = .12f; p.h = -.15f; p.v = 0; p.rot = 0;
-        ArmIK(p, F, { 13, -25 + 6 * std::sin(ph) }); ArmIK(p, B, { 12, -25 - 6 * std::sin(ph) });
+        ArmIK(p, F, { reach, -25 + 6 * std::sin(ph) }); ArmIK(p, B, { reach - 1, -25 - 6 * std::sin(ph) });
         LegIK(p, F, { 9, LEG - 7 + 5 * std::sin(ph + 1) }); LegIK(p, B, { 8, LEG - 7 - 5 * std::sin(ph + 1) });
     };
     s.push_back(climb);
