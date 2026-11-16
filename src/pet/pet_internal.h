@@ -156,7 +156,9 @@ struct Surface {
     void Free();
 };
 // Renders `draw` (in screen px) into a layered window that covers the screen rect `box` (premultiplied BGRA).
-// follow: re-centre the window on the content every frame (fast motion), instead of only at its edges.
-void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1RenderTarget*)>& draw, bool follow = false);
+// anchor (moving content): the window is centred on this point every frame; it must move smoothly (the
+// pet's body, not its bounding box, which changes shape as the limbs swing). Null: the window stays put
+// and only re-centres when the content reaches its edge.
+void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1RenderTarget*)>& draw, const POINT* anchor = nullptr);
 
 }  // namespace pet

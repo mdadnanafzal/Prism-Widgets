@@ -140,9 +140,13 @@ void Surface::Free() {
     if (mem) { DeleteDC(mem); mem = nullptr; }
     w = h = 0; placed = false;
 }
-void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1RenderTarget*)>& draw, bool follow) {
+void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1RenderTarget*)>& draw, const POINT* anchor) {
     int bw = box.right - box.left, bh = box.bottom - box.top;
     if (!hwnd || bw <= 0 || bh <= 0) return;
+    if (anchor) {   // centred on the anchor: size for the farther side of the box
+        bw = 2 * std::max(anchor->x - box.left, box.right - anchor->x);
+        bh = 2 * std::max(anchor->y - box.top, box.bottom - anchor->y);
+    }
     s.oversized = s.w > bw + 160 || s.h > bh + 160 ? s.oversized + 1 : 0;
     if (s.oversized > 30) { s.Free(); s.oversized = 0; }   // shrink back after a while (e.g. once the bed is gone)
     if (bw > s.w || bh > s.h || !s.rt) {   // grow in 64 px steps with some slack; frames reuse it
@@ -168,7 +172,8 @@ void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1Rend
     }
     // Moving a layered window costs more than drawing the pet, so the window stays put while the
     // content fits inside it and only moves (re-centred) when the content reaches an edge.
-    if (follow || !s.placed || box.left < s.org.x || box.top < s.org.y || box.right > s.org.x + s.w || box.bottom > s.org.y + s.h) {
+    if (anchor) { s.org = { anchor->x - s.w / 2, anchor->y - s.h / 2 }; s.placed = true; }
+    else if (!s.placed || box.left < s.org.x || box.top < s.org.y || box.right > s.org.x + s.w || box.bottom > s.org.y + s.h) {
         s.org = { box.left - (s.w - bw) / 2, box.top - (s.h - bh) / 2 }; s.placed = true;
     }
     {
@@ -224,7 +229,8 @@ static void Render() {
     bool moving = std::fabs(p.x - g_lastDrawn.x) + std::fabs(p.y - g_lastDrawn.y) > .5f || W.portal;
     g_lastDrawn = { p.x, p.y };
     bool fast = moving || g_dragging || W.hanging || g_kind == Kind::Phys;
-    Present(g_surf, g_wnd, box, [&](ID2D1RenderTarget* rt) { DrawPet(rt, W, p, e); }, fast);
+    POINT body{ (LONG)std::lround(p.x), (LONG)std::lround(p.y - U(22)) };   // middle of the body: moves smoothly
+    Present(g_surf, g_wnd, box, [&](ID2D1RenderTarget* rt) { DrawPet(rt, W, p, e); }, fast ? &body : nullptr);
 
     // Body box for the cursor hook: joints plus the limbs' thickness, the helmet a bit more.
     float pad = U(10), head = U(28);
