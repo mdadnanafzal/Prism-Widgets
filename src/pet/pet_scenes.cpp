@@ -2,6 +2,7 @@
 // Distances are in local units (scaled by W.st.scale) or prototype pixels (scaled by K()).
 #include "pet_internal.h"
 #include <cmath>
+#include <dwmapi.h>
 
 namespace pet {
 
@@ -100,7 +101,7 @@ static Step Walk(std::function<float()> to, float speed = 115, float yo0 = 0, fl
     Step s; s.motion = true;
     s.begin = [to, speed](Step& st) {
         st.f[0] = W.p.x; st.f[1] = W.p.v; st.f[2] = to();
-        st.dur = std::max(.05f, std::fabs(st.f[2] - st.f[0]) / (speed * K()));
+        st.dur = std::max(.05f, std::fabs(st.f[2] - st.f[0]) / (speed * K() * C.walkSpeed));
         W.p.face = st.f[2] >= st.f[0] ? 1.f : -1.f; W.idle = false; W.fps = 30;
     };
     s.update = [yo0, yo1](Step& st, float u, float, float t) {
@@ -298,8 +299,7 @@ static void ArmToLaptop(float dx = 2) { ArmIK(W.p, F, { W.lap.x + dx, W.lap.y - 
 
 Scene SceneCodingEnter() {
     Scene s;
-    s.push_back(Fps(30));
-    if (std::fabs(C.homeX - W.p.x) > 2) s.push_back(Walk([] { return C.homeX; }));
+    Append(s, SceneGoHome());
     s.push_back(Tw(TS(), .25f));
     s.push_back(Look([](Pose& q) { q.face = C.faceIn; }));
     s.push_back(Wait(.2f));
@@ -563,7 +563,7 @@ Scene SceneGrab(std::function<int()> hold) {
     chase.begin = [](Step& st) { st.f[0] = 0; W.idle = false; };
     chase.update = [](Step& st, float, float h, float) {
         float dir = W.cur.x >= W.p.x ? 1.f : -1.f, tx = W.cur.x - dir * U(30), dx = tx - W.p.x;
-        float step = std::min(std::fabs(dx), 115 * K() * h);
+        float step = std::min(std::fabs(dx), 115 * K() * C.walkSpeed * h);
         W.p.face = dx >= 0 ? 1.f : -1.f;
         W.p.x += step * W.p.face; st.f[0] += step;
         WalkPose(W.p, st.f[0] / (W.st.scale * 17), W.st);
@@ -704,6 +704,255 @@ Scene SceneWakeUp() {
     s.push_back(Tw(T(), .25f));
     s.push_back(Look([](Pose& q) { q.face = C.faceIn; }));
     s.push_back(Fps(15));
+    return s;
+}
+
+// ---------------------------------------------------------------- going home
+// Drop to a lower floor: a short hop first (hop) or straight off (stepping off a ledge), arms up,
+// then a crouched landing with dust. vx: prototype px/s sideways while falling.
+static Scene DropTo(float floorY, float vx, bool hop) {
+    Scene s;
+    if (hop) s.push_back(Tw([](Pose& q) { q.rot = 0; Crouch(q, 8, W.st); q.aF1 = .5f; q.aB1 = -.5f; }, .18f));
+    Step fall;
+    fall.begin = [vx, hop](Step& st) {
+        st.f[0] = vx * K(); st.f[1] = (hop ? -260 : -40) * K(); st.f[2] = 0;
+        W.fps = 30; W.idle = false; W.p.eyes = Eyes::O; W.p.mouth = Mouth::O;
+    };
+    fall.update = [floorY](Step& st, float, float h, float t) {
+        Pose& p = W.p;
+        st.f[1] += 1500 * K() * h; p.x += st.f[0] * h; p.y += st.f[1] * h;
+        p.rot = 0; p.v = Lerp(p.v, 1, .1f); p.t = 0; p.h = -.1f;
+        p.aF1 = 2.3f + .2f * std::sin(t * 18); p.aB1 = -2.3f - .2f * std::sin(t * 18); p.aF2 = .3f; p.aB2 = -.3f;
+        p.lF1 = .25f; p.lB1 = -.25f; p.lF2 = -.4f; p.lB2 = .4f;
+        float stand = floorY - U(STANDH);
+        if (p.y >= stand && st.f[1] > 0) { p.y = stand; st.f[2] = 1; }
+    };
+    fall.until = [](Step& st) { return st.f[2] != 0; };
+    s.push_back(fall);
+    s.push_back(Act([floorY] {
+        W.st.floor = floorY;
+        for (int i = 0; i < 5; i++) Dust(W.p.x + (Rand() - .5f) * 30 * K(), floorY - 3 * K(), (Rand() - .5f) * 80, -20 - Rand() * 30, .6f, 4);
+    }));
+    s.push_back(Tw([](Pose& q) {
+        q.rot = 0; q.v = 1; q.eyes = Eyes::Open; q.mouth = Mouth::Smile; Crouch(q, 12, W.st); q.aF1 = 1; q.aB1 = -1;
+    }, .15f, Ease::Out));
+    Append(s, StandUp(.3f));
+    return s;
+}
+
+// Way down 0: walk to the nearest screen edge and climb down it, hand over hand, to the taskbar.
+static Scene ClimbDown() {
+    float side = W.p.x - W.work.left < W.work.right - W.p.x ? -1.f : 1.f;   // -1: left edge
+    auto open = [](float x) {   // no other screen beyond this edge (else it would climb half on that screen)
+        return MonitorFromPoint(POINT{ (LONG)x, (LONG)(W.st.floor - U(40)) }, MONITOR_DEFAULTTONULL) == nullptr;
+    };
+    bool leftOpen = open(W.work.left - 4.f), rightOpen = open(W.work.right + 4.f);
+    if (side < 0 && !leftOpen && rightOpen) side = 1;
+    else if (side > 0 && !rightOpen && leftOpen) side = -1;
+    float wall = side < 0 ? (float)W.work.left : (float)W.work.right, x = wall - side * U(16);
+    Scene s;
+    s.push_back(Walk([x] { return x; }));
+    s.push_back(Tw(TS([side](Pose& q) { q.face = side; }), .2f));
+    s.push_back(Tw([](Pose& q) { q.t = .12f; q.h = -.2f; ArmIK(q, F, { 13, -26 }); ArmIK(q, B, { 12, -22 }); }, .3f));
+    Step climb; climb.motion = true;
+    climb.begin = [](Step& st) {
+        st.f[0] = W.p.y; st.f[1] = (float)W.work.bottom - U(STANDH);
+        st.dur = std::max(.3f, (st.f[1] - st.f[0]) / (U(60) * C.walkSpeed)); W.fps = 30; W.idle = false;
+    };
+    climb.update = [](Step& st, float u, float, float t) {
+        Pose& p = W.p; float ph = t * 7 * C.walkSpeed;
+        p.y = Lerp(st.f[0], st.f[1], u); p.t = .12f; p.h = -.15f; p.v = 0; p.rot = 0;
+        ArmIK(p, F, { 13, -25 + 6 * std::sin(ph) }); ArmIK(p, B, { 12, -25 - 6 * std::sin(ph) });
+        LegIK(p, F, { 9, LEG - 7 + 5 * std::sin(ph + 1) }); LegIK(p, B, { 8, LEG - 7 - 5 * std::sin(ph + 1) });
+    };
+    s.push_back(climb);
+    s.push_back(Act([] { W.st.floor = (float)W.work.bottom; }));
+    s.push_back(Tw(T(), .3f));
+    return s;
+}
+
+// Way down 2: walk across the screen like on glass, around the widgets, straight to home.
+// The path is a small A* on a coarse grid of the work area (well under a millisecond, so no thread).
+static bool Blocked(const std::vector<uint8_t>& b, int cols, int rows, int cx, int cy) {
+    return cx < 0 || cy < 0 || cx >= cols || cy >= rows || b[cy * cols + cx];
+}
+static std::vector<V2> FindPath(V2 from, V2 to) {
+    const RECT wa = W.work;
+    float cell = std::max(14.f, U(18));
+    int cols = (int)((wa.right - wa.left) / cell) + 1, rows = (int)((wa.bottom - wa.top) / cell) + 1, n = cols * rows;
+    std::vector<uint8_t> block(n, 0);
+    for (auto& w : g_widgets) {   // keep the pet's body (above its feet) off the widgets
+        if (!w->enabled || !w->hwnd) continue;
+        RECT r = PanelRect(w.get());
+        float x0 = r.left - U(26), x1 = r.right + U(26), y0 = (float)r.top, y1 = r.bottom + U(110);
+        for (int cy = 0; cy < rows; cy++) for (int cx = 0; cx < cols; cx++) {
+            float px = wa.left + (cx + .5f) * cell, py = wa.top + (cy + .5f) * cell;
+            if (px >= x0 && px <= x1 && py >= y0 && py <= y1) block[cy * cols + cx] = 1;
+        }
+    }
+    auto cellOf = [&](V2 p, int& cx, int& cy) {
+        cx = std::clamp((int)((p.x - wa.left) / cell), 0, cols - 1); cy = std::clamp((int)((p.y - wa.top) / cell), 0, rows - 1);
+    };
+    int sx, sy, gx, gy; cellOf(from, sx, sy); cellOf(to, gx, gy);
+    block[sy * cols + sx] = block[gy * cols + gx] = 0;
+    std::vector<float> g(n, 1e30f); std::vector<int> par(n, -1);
+    std::vector<std::pair<float, int>> open;   // min-heap on f
+    auto hcost = [&](int cx, int cy) { return std::hypot((float)(cx - gx), (float)(cy - gy)); };
+    g[sy * cols + sx] = 0; open.push_back({ hcost(sx, sy), sy * cols + sx });
+    bool found = false;
+    while (!open.empty()) {
+        std::pop_heap(open.begin(), open.end(), std::greater<>()); int cur = open.back().second; open.pop_back();
+        if (cur == gy * cols + gx) { found = true; break; }
+        int cx = cur % cols, cy = cur / cols;
+        for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+            if ((!dx && !dy) || Blocked(block, cols, rows, cx + dx, cy + dy)) continue;
+            if (dx && dy && (Blocked(block, cols, rows, cx + dx, cy) || Blocked(block, cols, rows, cx, cy + dy))) continue;   // no corner cutting
+            int nb = (cy + dy) * cols + cx + dx; float ng = g[cur] + (dx && dy ? 1.414f : 1.f);
+            if (ng < g[nb]) { g[nb] = ng; par[nb] = cur; open.push_back({ ng + hcost(cx + dx, cy + dy), nb }); std::push_heap(open.begin(), open.end(), std::greater<>()); }
+        }
+    }
+    if (!found) return { from, to };
+    std::vector<V2> cells;
+    for (int c = gy * cols + gx; c != -1; c = par[c]) cells.push_back({ wa.left + (c % cols + .5f) * cell, wa.top + (c / cols + .5f) * cell });
+    std::reverse(cells.begin(), cells.end());
+    cells.front() = from; cells.back() = to;
+    auto clear = [&](V2 a, V2 b) {   // straight line stays in free cells
+        float len = std::hypot(b.x - a.x, b.y - a.y); int steps = std::max(1, (int)(len / (cell * .5f)));
+        for (int i = 0; i <= steps; i++) {
+            V2 p{ Lerp(a.x, b.x, i / (float)steps), Lerp(a.y, b.y, i / (float)steps) }; int cx, cy; cellOf(p, cx, cy);
+            if (block[cy * cols + cx] && !(cx == sx && cy == sy) && !(cx == gx && cy == gy)) return false;
+        }
+        return true;
+    };
+    std::vector<V2> path{ cells.front() };   // string pulling: drop corners that can be seen past
+    for (size_t i = 1; i + 1 < cells.size(); i++) if (!clear(path.back(), cells[i + 1])) path.push_back(cells[i]);
+    path.push_back(cells.back());
+    return path;
+}
+// Feet follow the points (screen px); side-on walk cycle, facing the way it moves.
+static Step WalkPath(std::vector<V2> pts) {
+    Step s; s.motion = true;
+    float total = 0;
+    for (size_t i = 1; i < pts.size(); i++) total += std::hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    s.begin = [total](Step& st) { st.f[0] = W.p.v; st.dur = std::max(.05f, total / (115 * K() * C.walkSpeed)); W.idle = false; W.fps = 30; };
+    s.update = [pts, total](Step& st, float u, float, float t) {
+        float d = u * total, acc = 0;
+        V2 at = pts.back(), seg{ 1, 0 };
+        for (size_t i = 1; i < pts.size(); i++) {
+            float l = std::hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+            if (acc + l >= d && l > 0) { float k = (d - acc) / l; at = { Lerp(pts[i - 1].x, pts[i].x, k), Lerp(pts[i - 1].y, pts[i].y, k) }; seg = { pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y }; break; }
+            acc += l;
+        }
+        if (std::fabs(seg.x) > .3f * std::hypot(seg.x, seg.y)) W.p.face = seg.x >= 0 ? 1.f : -1.f;
+        W.st.floor = at.y; W.p.x = at.x;
+        WalkPose(W.p, d / (W.st.scale * 17), W.st);
+        W.p.v = st.f[0] * std::max(0.f, 1 - t / .15f);
+    };
+    return s;
+}
+
+// Way down 3: use the top edges of open windows as ledges: drop onto the highest ledge below,
+// walk along it toward home, step off its end, and so on down to the taskbar.
+struct Ledge { float l, r, y; };
+static std::vector<Ledge> Ledges() {
+    struct Ctx { std::vector<Ledge> out; RECT wa; DWORD pid; } c{ {}, W.work, GetCurrentProcessId() };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        Ctx* c = (Ctx*)lp;
+        if (!IsWindowVisible(h) || IsIconic(h) || (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
+        DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+        if (pid == c->pid) return TRUE;
+        BOOL cloaked = FALSE; DwmGetWindowAttribute(h, 14 /*DWMWA_CLOAKED*/, &cloaked, sizeof cloaked);
+        if (cloaked) return TRUE;
+        RECT r;
+        if (FAILED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof r))) GetWindowRect(h, &r);
+        if (r.right - r.left < 160 || r.bottom - r.top < 80) return TRUE;
+        if (r.top <= c->wa.top + 2 || r.top >= c->wa.bottom - 20) return TRUE;   // maximised windows and the taskbar: no ledge
+        float l = (float)std::max(r.left, c->wa.left), rr = (float)std::min(r.right, c->wa.right);
+        if (rr - l > 80) c->out.push_back({ l, rr, (float)r.top });
+        return TRUE;
+    }, (LPARAM)&c);
+    return c.out;
+}
+static Scene LedgePath() {
+    std::vector<Ledge> ledges = Ledges();
+    float x = W.p.x, y = W.st.floor, bottom = (float)W.work.bottom, m = U(14), home = C.homeX;
+    Scene s;
+    for (int guard = 0; guard < 12 && y < bottom - 2; guard++) {
+        const Ledge* below = nullptr;   // the highest ledge under its feet
+        for (auto& L : ledges) if (L.y > y + 4 && x >= L.l + m && x <= L.r - m && (!below || L.y < below->y)) below = &L;
+        Append(s, DropTo(below ? below->y : bottom, 0, guard == 0));
+        if (!below) break;
+        y = below->y;
+        float dir = home >= x ? 1.f : -1.f, end = dir > 0 ? below->r : below->l;
+        if (home > below->l && home < below->r) {   // home is under this ledge: leave by the nearer end
+            end = home - below->l < below->r - home ? below->l : below->r; dir = end > x ? 1.f : -1.f;
+        }
+        x = end + dir * m;   // one step past the end, then down
+        s.push_back(Walk([x] { return x; }));
+    }
+    return s;
+}
+
+// On another screen: a portal opens beside it, it walks in, and comes out of another one at home.
+static void PortalOpen(float u) { W.portalOpen = u; }
+static Scene PortalHome() {
+    Scene s;
+    s.push_back(Act([] {
+        float d = W.p.x > (W.work.left + W.work.right) / 2.f ? -1.f : 1.f;
+        W.portal = true; W.portalX = W.p.x + d * U(42); W.portalFloor = W.st.floor; W.portalOpen = 0; W.fps = 30; W.idle = false;
+    }));
+    s.push_back(Tw(T([](Pose& q) { q.face = W.portalX >= q.x ? 1.f : -1.f; q.eyes = Eyes::O; }), .2f));
+    s.push_back(Wait(.4f, [](float u, float, float) { PortalOpen(Eased(Ease::Out, u)); }));
+    s.push_back(Look([](Pose& q) { q.eyes = Eyes::Happy; }));
+    s.push_back(Walk([] { return W.portalX - (W.portalX > W.p.x ? 1 : -1) * U(14); }));
+    Step in; in.dur = .45f;   // pulled in, shrinking into the middle of the ring
+    in.begin = [](Step& st) { st.f[0] = W.p.x; st.f[1] = W.p.y; };
+    in.update = [](Step& st, float u, float, float) {
+        float v = Eased(Ease::In, u);
+        W.shrink = Lerp(1, .05f, v); W.p.x = Lerp(st.f[0], W.portalX, v); W.p.y = Lerp(st.f[1], W.portalFloor - U(38), v);
+    };
+    s.push_back(in);
+    s.push_back(Act([] { W.shrink = 0; }));
+    s.push_back(Wait(.3f, [](float u, float, float) { PortalOpen(1 - u); }));
+    s.push_back(Act([] {   // the other end, beside home on the home screen
+        float x, fl; HomeAfterPortal(x, fl);
+        W.portalX = x + C.faceIn * U(50); W.portalFloor = fl; W.st.floor = fl;
+        W.p.x = W.portalX; W.p.y = fl - U(38); W.p.face = -C.faceIn; W.portalOpen = 0;
+    }));
+    s.push_back(Wait(.4f, [](float u, float, float) { PortalOpen(Eased(Ease::Out, u)); }));
+    Step out; out.dur = .45f;
+    out.begin = [](Step& st) { st.f[0] = W.p.y; };
+    out.update = [](Step& st, float u, float, float) {
+        float v = Eased(Ease::Out, u);
+        W.shrink = Lerp(.05f, 1, v); W.p.y = Lerp(st.f[0], W.st.StandY(), v);
+    };
+    s.push_back(out);
+    s.push_back(Act([] { W.shrink = 1; }));
+    s.push_back(Tw(T([](Pose& q) { q.eyes = Eyes::Open; }), .2f));
+    s.push_back(Wait(.3f, [](float u, float, float) { PortalOpen(1 - u); }));
+    s.push_back(Act([] { W.portal = false; }));
+    return s;
+}
+
+Scene SceneGoHome() {
+    Scene s;
+    s.push_back(Fps(30));
+    if (!OnHomeScreen()) {
+        if (C.portalHome) Append(s, PortalHome());
+        else s.push_back(Act([] { AdoptThisScreen(); }));   // this screen's bottom-right becomes home
+    }
+    if (OnHomeScreen() || !C.portalHome) {
+        if (W.st.floor < W.work.bottom - 2) {   // up on an invisible floor: get down to the taskbar first
+            switch (C.wayDown) {
+            case 1: Append(s, DropTo((float)W.work.bottom, (C.homeX >= W.p.x ? 1 : -1) * 60.f, true)); break;
+            case 2: s.push_back(WalkPath(FindPath({ W.p.x, W.st.floor }, { C.homeX, (float)W.work.bottom }))); s.push_back(Act([] { W.st.floor = (float)W.work.bottom; })); break;
+            case 3: Append(s, LedgePath()); break;
+            default: Append(s, ClimbDown()); break;
+            }
+        }
+    }
+    s.push_back(Walk([] { return C.homeX; }));
+    s.push_back(Tw(T(), .25f));
     return s;
 }
 

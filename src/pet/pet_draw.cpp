@@ -479,10 +479,22 @@ static void DrawBed(ID2D1RenderTarget* rt, const Bed& b, float s, float k) {
     rt->PopAxisAlignedClip();
 }
 
+// A portal: an upright glowing ring standing on the floor, dark inside.
+static void DrawPortal(ID2D1RenderTarget* rt, const World& w) {
+    float s = w.st.scale, o = w.portalOpen, cx = w.portalX, cy = w.portalFloor - 38 * s, rx = 22 * s * o, ry = 40 * s * o;
+    ID2D1SolidColorBrush* br = g_gr.br;
+    for (float f : { 1.4f, 1.2f }) { D2D1_ELLIPSE e{ { cx, cy }, rx * f, ry * f }; br->SetColor(Alpha(w.glow, .12f)); rt->FillEllipse(&e, br); }
+    D2D1_ELLIPSE ring{ { cx, cy }, rx, ry }; br->SetColor(Alpha(w.glow, .95f)); rt->FillEllipse(&ring, br);
+    D2D1_ELLIPSE in{ { cx, cy }, std::max(0.f, rx - 3 * s * o), std::max(0.f, ry - 3 * s * o) };
+    br->SetColor(D2D1_COLOR_F{ .04f, .05f, .09f, .94f }); rt->FillEllipse(&in, br);
+    D2D1_ELLIPSE swirl{ { cx, cy }, rx * .55f, ry * .6f }; br->SetColor(Alpha(w.glow, .16f)); rt->FillEllipse(&swirl, br);
+}
+
 void DrawPet(ID2D1RenderTarget* rt, const World& w, const Pose& p, Expr expr) {
     float k = w.st.scale / 1.25f;
     if (w.bed) DrawBed(rt, w.bd, w.st.scale, k);
-    DrawRobot(rt, p, w.st.scale, *w.pal, w.glow, expr, &w);
+    if (w.portal && w.portalOpen > .01f) DrawPortal(rt, w);
+    if (w.shrink > .06f) DrawRobot(rt, p, w.st.scale * w.shrink, *w.pal, w.glow, expr, &w);   // smaller while it goes through a portal
     DrawParticles(rt, w.parts, k);
     if (w.time <= w.dizzyUntil && g_star) {   // dizzy stars circling the helmet
         V2 hd = ToWorld(p, Kinematics(p).head, w.st.scale);

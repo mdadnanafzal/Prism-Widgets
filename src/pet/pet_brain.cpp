@@ -33,7 +33,8 @@ static RECT g_hit{};
 static Surface g_surf;
 
 // home spot: a corner distance on a named monitor, in DIP (unset = bottom-right of the primary screen)
-static bool g_homeSet = false; static std::wstring g_homeMon; static bool g_homeRight = true; static float g_homeDx = 0, g_homeDy = 0;
+// Home is always the bottom-right of a screen, on the taskbar edge: the main screen unless set to another.
+static bool g_homeSet = false; static std::wstring g_homeMon;
 
 // app modes
 static bool g_codingOn = false, g_browserOn = false, g_leaveCode = false, g_leaveWeb = false;
@@ -82,21 +83,15 @@ static void DefaultLists(PetSettings& s) {
 }
 
 // ---------------------------------------------------------------- home and placement
+static HMONITOR HomeMonitor() {
+    HMONITOR m = g_homeSet ? MonByName(g_homeMon) : nullptr;   // an unplugged screen falls back to the main one
+    return m ? m : MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+}
 static void HomePlace(HMONITOR& mon, float& x, float& floorY) {
-    mon = g_homeSet ? MonByName(g_homeMon) : nullptr;
-    bool saved = mon != nullptr;
-    if (!mon) mon = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    mon = HomeMonitor();
     RECT wa = WorkOf(mon);
-    float dip = ScaleOf(mon), s = dip * g_set.size;
-    if (saved) {
-        x = g_homeRight ? wa.right - g_homeDx * dip : wa.left + g_homeDx * dip;
-        floorY = wa.bottom - g_homeDy * dip;
-    } else {   // bottom-right, standing on the taskbar's top edge
-        x = wa.right - 45 * s;
-        floorY = (float)wa.bottom;
-    }
-    x = std::clamp(x, wa.left + 30 * s, wa.right - 30 * s);
-    floorY = std::clamp(floorY, (float)wa.top + 140 * s, (float)wa.bottom);
+    x = wa.right - 45 * ScaleOf(mon) * g_set.size;   // bottom-right, standing on the taskbar's top edge
+    floorY = (float)wa.bottom;
 }
 
 static void PlaceAtHome() {
@@ -115,17 +110,25 @@ static void PlaceAtHome() {
     W.p = p; g_shown = p; g_blend = 1;
 }
 
-static void SaveHome() {
-    HMONITOR mon = MonitorFromPoint(POINT{ (LONG)W.p.x, (LONG)W.p.y }, MONITOR_DEFAULTTONEAREST);
+static HMONITOR PetMonitor() { return MonitorFromPoint(POINT{ (LONG)W.p.x, (LONG)(W.p.y - U(20)) }, MONITOR_DEFAULTTONEAREST); }
+static void UpdateHomeCtx() {
+    HMONITOR mon; float x, floorY;
+    HomePlace(mon, x, floorY);
     RECT wa = WorkOf(mon);
-    float dip = ScaleOf(mon);
-    g_homeSet = true; g_homeMon = MonName(mon);
-    g_homeRight = W.p.x - wa.left > wa.right - W.p.x;
-    g_homeDx = (g_homeRight ? wa.right - W.p.x : W.p.x - wa.left) / dip;
-    g_homeDy = (wa.bottom - W.st.floor) / dip;
-    C.homeX = W.p.x;
-    C.faceIn = W.p.x > (wa.left + wa.right) / 2.f ? -1.f : 1.f;
+    C.homeX = x;
+    C.faceIn = x > (wa.left + wa.right) / 2.f ? -1.f : 1.f;
+}
+bool OnHomeScreen() { return PetMonitor() == HomeMonitor(); }
+void AdoptThisScreen() {
+    g_homeSet = true; g_homeMon = MonName(PetMonitor());
+    UpdateHomeCtx();
     RequestSave();
+}
+void HomeAfterPortal(float& x, float& floorY) {
+    HMONITOR mon;
+    HomePlace(mon, x, floorY);
+    UpdateHomeCtx();
+    UseMonitor(mon);
 }
 
 // ---------------------------------------------------------------- rendering
@@ -136,9 +139,11 @@ void Surface::Free() {
     if (mem) { DeleteDC(mem); mem = nullptr; }
     w = h = 0; placed = false;
 }
-void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1RenderTarget*)>& draw) {
+void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1RenderTarget*)>& draw, bool follow) {
     int bw = box.right - box.left, bh = box.bottom - box.top;
     if (!hwnd || bw <= 0 || bh <= 0) return;
+    s.oversized = s.w > bw + 160 || s.h > bh + 160 ? s.oversized + 1 : 0;
+    if (s.oversized > 30) { s.Free(); s.oversized = 0; }   // shrink back after a while (e.g. once the bed is gone)
     if (bw > s.w || bh > s.h || !s.rt) {   // grow in 64 px steps with some slack; frames reuse it
         int w = std::max(s.w, (bw + 32 + 63) / 64 * 64), h = std::max(s.h, (bh + 32 + 63) / 64 * 64);
         s.Free();
@@ -162,7 +167,7 @@ void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1Rend
     }
     // Moving a layered window costs more than drawing the pet, so the window stays put while the
     // content fits inside it and only moves (re-centred) when the content reaches an edge.
-    if (!s.placed || box.left < s.org.x || box.top < s.org.y || box.right > s.org.x + s.w || box.bottom > s.org.y + s.h) {
+    if (follow || !s.placed || box.left < s.org.x || box.top < s.org.y || box.right > s.org.x + s.w || box.bottom > s.org.y + s.h) {
         s.org = { box.left - (s.w - bw) / 2, box.top - (s.h - bh) / 2 }; s.placed = true;
     }
     {
@@ -207,11 +212,14 @@ static void Render() {
     l -= M; r += M; t -= M; b += M;
     if (W.laptop) { l = std::min(l, p.x - U(45)); r = std::max(r, p.x + U(45)); }
     for (const Particle& q : W.parts) {
+        if (std::fabs(q.x - p.x) > U(160) || std::fabs(q.y - p.y) > U(200)) continue;   // stray particles never widen the window
         l = std::min(l, q.x - 30 * k); r = std::max(r, q.x + 90 * k); t = std::min(t, q.y - 40 * k); b = std::max(b, q.y + 20 * k);
     }
+    if (W.portal) { l = std::min(l, W.portalX - U(36)); r = std::max(r, W.portalX + U(36)); t = std::min(t, W.portalFloor - U(90)); b = std::max(b, W.portalFloor + U(4)); }
     if (W.bed) { l = std::min(l, W.bd.x - 4); r = std::max(r, W.bd.x + U(127)); t = std::min(t, W.bd.floor - U(30)); b = std::max(b, W.bd.floor + U(4)); }
     RECT box{ (LONG)std::floor(l), (LONG)std::floor(t), (LONG)std::ceil(r), (LONG)std::ceil(b) };
-    Present(g_surf, g_wnd, box, [&](ID2D1RenderTarget* rt) { DrawPet(rt, W, p, e); });
+    bool fast = g_dragging || W.hanging || g_kind == Kind::Phys;   // fast motion: the window follows every frame
+    Present(g_surf, g_wnd, box, [&](ID2D1RenderTarget* rt) { DrawPet(rt, W, p, e); }, fast);
 
     // Body box for the cursor hook: joints plus the limbs' thickness, the helmet a bit more.
     float pad = U(10), head = U(28);
@@ -337,6 +345,7 @@ static void Frame() {
     POINT at = g_dragging || W.hanging ? cp : POINT{ (LONG)W.p.x, (LONG)(W.p.y - U(20)) };
     UseMonitor(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST));
     W.pal = &PaletteOf(g_set.theme); W.glow = GlowColour();
+    C.walkSpeed = g_set.walkSpeed; C.wayDown = g_set.wayDown; C.portalHome = g_set.portalHome;
     int n = std::max(1, (int)std::ceil(dt * 120));   // fixed 1/120 s simulation steps
     float h = dt / n;
     for (int i = 0; i < n; i++) {
@@ -484,7 +493,7 @@ void BeginDrag() {
     g_grabActive = false; g_grabHold = 0;
     POINT c; GetCursorPos(&c);
     W.cur = Cursor{}; W.cur.x = W.cur.px = (float)c.x; W.cur.y = W.cur.py = (float)c.y; g_lastCur = c;
-    Start(SceneDragHang([] { return g_released; }), Kind::Drag, [] { g_dragging = false; SaveHome(); Next(); }, true);
+    Start(SceneDragHang([] { return g_released; }), Kind::Drag, [] { g_dragging = false; Next(); }, true);
     HookRefresh();
     SetFrameRate(TargetFps());
 }
@@ -538,13 +547,17 @@ void PetLoadSettings(const JVal* j) {
     s.theme = PaletteOf(j->str(L"theme", L"pearl")).id;   // unknown names fall back to Pearl
     s.glow = j->str(L"glow", L"theme") == L"accent" ? L"accent" : L"theme";
     s.size = Clamp((float)j->num(L"size", .85), .6f, 1.5f);
-    s.mischiefMinutes = Clamp((int)j->num(L"mischiefMinutes", 30), 0, 24 * 60);
+    s.mischiefMinutes = Clamp((float)j->num(L"mischiefMinutes", 30), .5f, 24 * 60.f);   // at least 30 s
     if (const JVal* pc = j->get(L"pacing"); pc && pc->isObj()) {
         s.pacing = pc->boolean(L"enabled", true);
-        s.pacingMinutes = Clamp((int)pc->num(L"idleMinutes", 5), 1, 120);
+        s.pacingMinutes = Clamp((float)pc->num(L"idleMinutes", 5), .25f, 120.f);   // at least 15 s
         s.pacingRange = Clamp((float)pc->num(L"range", 1 / 3.0), .1f, 1.f);
     }
     s.collision = j->boolean(L"collision", false);
+    s.walkSpeed = Clamp((float)j->num(L"walkSpeed", 1), .5f, 2.f);
+    std::wstring wd = j->str(L"wayDown", L"climb");
+    s.wayDown = wd == L"jump" ? 1 : wd == L"screen" ? 2 : wd == L"ledges" ? 3 : 0;
+    s.portalHome = j->str(L"otherScreen", L"portal") != L"adopt";
     auto list = [&](const wchar_t* key, std::vector<std::wstring>& out) {
         const JVal* a = j->get(key);
         if (!a || !a->isArr()) return;
@@ -555,12 +568,7 @@ void PetLoadSettings(const JVal* j) {
     list(L"browserApps", s.browserApps);
     g_set = s;
     g_homeSet = false;
-    if (const JVal* h = j->get(L"home"); h && h->isObj()) {
-        g_homeSet = true;
-        g_homeMon = h->str(L"monitor", L"");
-        g_homeRight = h->str(L"anchor", L"right") != L"left";
-        g_homeDx = (float)h->num(L"dx", 45); g_homeDy = (float)h->num(L"dy", 0);
-    }
+    if (const JVal* h = j->get(L"home"); h && h->isObj() && !h->str(L"monitor", L"").empty()) { g_homeSet = true; g_homeMon = h->str(L"monitor", L""); }
 }
 
 void PetSaveSettings(JVal& j) {
@@ -569,10 +577,10 @@ void PetSaveSettings(JVal& j) {
     j.set(L"theme") = JVal::MakeStr(g_set.theme);
     j.set(L"glow") = JVal::MakeStr(g_set.glow);
     j.set(L"size") = JVal::MakeNum(std::round(g_set.size * 100) / 100);
-    j.set(L"mischiefMinutes") = JVal::MakeNum(g_set.mischiefMinutes);
+    j.set(L"mischiefMinutes") = JVal::MakeNum(std::round(g_set.mischiefMinutes * 1000) / 1000);
     JVal& pc = j.set(L"pacing"); pc = JVal::MakeObj();
     pc.set(L"enabled") = JVal::MakeBool(g_set.pacing);
-    pc.set(L"idleMinutes") = JVal::MakeNum(g_set.pacingMinutes);
+    pc.set(L"idleMinutes") = JVal::MakeNum(std::round(g_set.pacingMinutes * 1000) / 1000);
     pc.set(L"range") = JVal::MakeNum(std::round(g_set.pacingRange * 1000) / 1000);
     j.set(L"collision") = JVal::MakeBool(g_set.collision);
     auto list = [&](const wchar_t* key, const std::vector<std::wstring>& in) {
@@ -581,13 +589,11 @@ void PetSaveSettings(JVal& j) {
     };
     list(L"codingApps", g_set.codingApps);
     list(L"browserApps", g_set.browserApps);
-    if (g_homeSet) {
-        JVal& h = j.set(L"home"); h = JVal::MakeObj();
-        h.set(L"monitor") = JVal::MakeStr(g_homeMon);
-        h.set(L"anchor") = JVal::MakeStr(g_homeRight ? L"right" : L"left");
-        h.set(L"dx") = JVal::MakeNum(std::round(g_homeDx * 10) / 10);
-        h.set(L"dy") = JVal::MakeNum(std::round(g_homeDy * 10) / 10);
-    }
+    j.set(L"walkSpeed") = JVal::MakeNum(std::round(g_set.walkSpeed * 100) / 100);
+    const wchar_t* ways[] = { L"climb", L"jump", L"screen", L"ledges" };
+    j.set(L"wayDown") = JVal::MakeStr(ways[Clamp(g_set.wayDown, 0, 3)]);
+    j.set(L"otherScreen") = JVal::MakeStr(g_set.portalHome ? L"portal" : L"adopt");
+    if (g_homeSet) { JVal& h = j.set(L"home"); h = JVal::MakeObj(); h.set(L"monitor") = JVal::MakeStr(g_homeMon); }
 }
 
 void PetInit(bool atLogin) {
@@ -624,8 +630,20 @@ void PetApplySettings() {
 
 void PetResetPosition() {
     g_homeSet = false;
-    Relayout();
+    Relayout();   // back home on the main screen
     RequestSave();
+}
+
+void PetSetHomeHere() {
+    if (!g_wnd) return;
+    AdoptThisScreen();
+}
+
+std::wstring PetHomeName() {
+    MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi); GetMonitorInfoW(HomeMonitor(), &mi);
+    if (mi.dwFlags & MONITORINFOF_PRIMARY) return L"Main screen";
+    std::wstring n = mi.szDevice; size_t p = n.rfind(L'\\');
+    return L"Screen " + (p == std::wstring::npos ? n : n.substr(p + 1));
 }
 
 void PetArrange(bool on) {
@@ -640,6 +658,7 @@ void PetOnSession(PetSession e) {
         if (g_asleep || g_dragging) return;   // snap to bed silently: the screen is already hidden
         HookSet(HookMode::Off);
         FxShutdown();
+        PlaceAtHome();   // the bed is at home
         SnapAsleep();
         g_asleep = true; g_mode = Mode::None;
         Start(SceneSleep([] { return !g_asleep; }), Kind::Sleep);

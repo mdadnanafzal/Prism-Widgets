@@ -45,6 +45,8 @@ struct World {
     Phys phys; Cursor cur;
     std::vector<Particle> parts;
     const Palette* pal = nullptr; D2D1_COLOR_F glow{};
+    bool portal = false; float portalX = 0, portalFloor = 0, portalOpen = 0;   // screen px; open 0..1
+    float shrink = 1;            // 1 = normal size; smaller while it goes through a portal
 };
 extern World W;
 
@@ -76,6 +78,9 @@ struct SceneCtx {             // where things are, in screen px
     float homeX = 0;
     float faceIn = -1;        // facing toward the middle of the screen when sitting at home
     bool reduced = false;     // Windows animation effects are off
+    float walkSpeed = 1;      // walk speed setting (all walks)
+    int wayDown = 0;          // from above the taskbar: 0 climb down the screen edge, 1 jump down, 2 walk across the screen, 3 window ledges
+    bool portalHome = true;   // on another screen: go back through a portal (else that screen becomes home)
 };
 extern SceneCtx C;
 
@@ -104,6 +109,10 @@ Scene SceneKnockedOver(float dir);
 Scene SceneThrown();                                  // W.phys already set
 Scene SceneSleep(std::function<bool()> until);
 Scene SceneWakeUp();
+Scene SceneGoHome();                                  // to the home spot: portal or adopt the screen, get down, walk
+bool OnHomeScreen();                                  // pet_brain.cpp
+void AdoptThisScreen();                               // pet_brain.cpp: this screen's bottom-right becomes home
+void HomeAfterPortal(float& x, float& floorY);        // pet_brain.cpp: home spot on the home screen, screen px
 void SnapAsleep();                                    // in bed, no animation
 void PutAwayProps();
 
@@ -143,9 +152,11 @@ struct Surface {
     HDC mem = nullptr; HBITMAP dib = nullptr; HGDIOBJ old = nullptr; int w = 0, h = 0;
     ID2D1DCRenderTarget* rt = nullptr; ID2D1SolidColorBrush* br = nullptr;
     POINT org{}; bool placed = false;   // window position; it stays put while `box` fits inside
+    int oversized = 0;                  // frames in a row the surface was much bigger than needed
     void Free();
 };
 // Renders `draw` (in screen px) into a layered window that covers the screen rect `box` (premultiplied BGRA).
-void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1RenderTarget*)>& draw);
+// follow: re-centre the window on the content every frame (fast motion), instead of only at its edges.
+void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1RenderTarget*)>& draw, bool follow = false);
 
 }  // namespace pet

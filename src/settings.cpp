@@ -636,21 +636,22 @@ float PagePet(float x0, float x1, float y) {
             if (done) PetApplySettings();
         });
     } });
-    look.push_back({ L"Position", L"Drag the pet to move it. Reset puts it back at the bottom right.", [](D2D1_RECT_F r) {
-        Button(r.right, (r.top + r.bottom) / 2, L"Reset", false, [] { PetResetPosition(); }); } });
+    look.push_back({ L"Home", L"Bottom-right of: " + PetHomeName() + L". Drag the pet anywhere; it walks home to code.", [](D2D1_RECT_F r) {
+        float bw = Button(r.right, (r.top + r.bottom) / 2, L"Main screen", false, [] { PetResetPosition(); });
+        Button(r.right - bw - 10, (r.top + r.bottom) / 2, L"Set to this screen", false, [] { PetSetHomeHere(); }); } });
     y = Group(x0, x1, y, L"", look);
 
-    auto pick = [](const std::vector<int>& vals, int v) { int best = 0; for (int i = 0; i < (int)vals.size(); i++) if (std::abs(vals[i] - v) < std::abs(vals[best] - v)) best = i; return best; };
+    auto pick = [](const std::vector<float>& vals, float v) { int best = 0; for (int i = 0; i < (int)vals.size(); i++) if (std::fabs(vals[i] - v) < std::fabs(vals[best] - v)) best = i; return best; };
     std::vector<RowSpec> beh;
     beh.push_back({ L"Mischief", L"No clicks for this long (active time): a flower pot, then a cursor grab", [&c, pick](D2D1_RECT_F r) {
-        static const std::vector<int> v{ 15, 30, 60, 120 };
+        static const std::vector<float> v{ 15, 30, 60, 120 };
         Segmented(r.right, (r.top + r.bottom) / 2, { L"15 min", L"30 min", L"1 hour", L"2 hours" }, pick(v, c.mischiefMinutes), [&c](int i) {
             c.mischiefMinutes = v[i]; PetApplySettings(); }); } });
     beh.push_back({ L"Pacing when bored", L"Paces back and forth after standing still for a while", [&c](D2D1_RECT_F r) {
         Toggle(r.right, (r.top + r.bottom) / 2, c.pacing, [&c] { c.pacing = !c.pacing; PetApplySettings(); }); } });
     if (c.pacing) {
         beh.push_back({ L"Bored after", L"", [&c, pick](D2D1_RECT_F r) {
-            static const std::vector<int> v{ 2, 5, 10, 15 };
+            static const std::vector<float> v{ 2, 5, 10, 15 };
             Segmented(r.right, (r.top + r.bottom) / 2, { L"2 min", L"5 min", L"10 min", L"15 min" }, pick(v, c.pacingMinutes), [&c](int i) {
                 c.pacingMinutes = v[i]; PetApplySettings(); }); } });
         beh.push_back({ L"Pacing range", L"Part of the screen width", [&c](D2D1_RECT_F r) {
@@ -658,9 +659,28 @@ float PagePet(float x0, float x1, float y) {
             Segmented(r.right, (r.top + r.bottom) / 2, { L"1/4", L"1/3", L"1/2" }, sel, [&c](int i) {
                 c.pacingRange = i == 0 ? .25f : i == 1 ? 1 / 3.f : .5f; PetApplySettings(); }); } });
     }
+    beh.push_back({ L"Walk speed", L"Every walk: home, to the screen edge, pacing, under the cursor", [&c](D2D1_RECT_F r) {
+        int sel = c.walkSpeed < .85f ? 0 : c.walkSpeed > 1.2f ? 2 : 1;
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Slow", L"Normal", L"Fast" }, sel, [&c](int i) {
+            c.walkSpeed = i == 0 ? .7f : i == 2 ? 1.4f : 1.f; PetApplySettings(); }); } });
     beh.push_back({ L"Cursor collision", L"The moving cursor can bump the pet over or knock it flying", [&c](D2D1_RECT_F r) {
         Toggle(r.right, (r.top + r.bottom) / 2, c.collision, [&c] { c.collision = !c.collision; PetApplySettings(); }); } });
     y = Group(x0, x1, y, L"Behaviour", beh);
+
+    std::vector<RowSpec> way;
+    RowSpec down{ L"Getting down", L"When it was dropped above the taskbar and needs to get home", [&c](D2D1_RECT_F r) {
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Climb down", L"Jump down", L"Walk across", L"Window ledges" }, c.wayDown, [&c](int i) {
+            c.wayDown = i; PetApplySettings(); }); } };
+    down.stacked = true; down.h = 104;
+    way.push_back(down);
+    way.push_back({ L"On another screen", L"Go back through a portal, or make that screen's bottom-right its home", [&c](D2D1_RECT_F r) {
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Portal home", L"Make it home" }, c.portalHome ? 0 : 1, [&c](int i) {
+            c.portalHome = i == 0; PetApplySettings(); }); } });
+    y = Group(x0, x1, y, L"Getting home", way);
+
+#if __has_include("pet/pet_dev.inc")
+#include "pet/pet_dev.inc"   // local testing options, not part of the project
+#endif
 
     std::vector<RowSpec> apps;
     apps.push_back({ L"Coding tools", JoinApps(c.codingApps), [&c](D2D1_RECT_F r) {

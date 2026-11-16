@@ -7,16 +7,21 @@ struct PetSettings {
     std::wstring theme = L"pearl";     // pearl | graphite | sand
     std::wstring glow = L"theme";      // theme | accent
     float size = .85f;                 // 0.6 - 1.5
-    int mischiefMinutes = 30;          // flower pot / cursor grab interval (active time)
+    float mischiefMinutes = 30;        // flower pot / cursor grab interval (active time)
     bool pacing = true;
-    int pacingMinutes = 5;             // standing still before pacing
+    float pacingMinutes = 5;           // standing still before pacing
     float pacingRange = 1 / 3.f;       // fraction of the screen width
     bool collision = false;            // the cursor can bump the pet
+    float walkSpeed = 1;               // all walks: .7 slow, 1 normal, 1.4 fast
+    int wayDown = 0;                   // from above the taskbar: 0 climb down, 1 jump down, 2 walk across the screen, 3 window ledges
+    bool portalHome = true;            // on another screen: portal back to the home screen (false: that screen becomes home)
     std::vector<std::wstring> codingApps, browserApps;   // process file names
 };
 PetSettings& PetConfig();
 void PetApplySettings();               // after changing PetConfig(): show/hide, redraw, save
-void PetResetPosition();
+void PetResetPosition();               // home = bottom-right of the main screen
+void PetSetHomeHere();                 // home = bottom-right of the screen the pet is on
+std::wstring PetHomeName();            // the home screen, for Settings
 
 void PetLoadSettings(const JVal* j);   // the "pet" object in config.json (may be null)
 void PetSaveSettings(JVal& j);
