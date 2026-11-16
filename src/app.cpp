@@ -4,6 +4,7 @@
 #include "weather.h"
 #include "events.h"
 #include "net.h"
+#include "pet/pet.h"
 #include <psapi.h>
 #include <algorithm>
 #include <shellscalingapi.h>
@@ -446,6 +447,7 @@ static void SaveConfigNow() {
     c.set(L"settingsTheme") = JVal::MakeStr(g_uiTheme);
     g_weather.SaveSettings(c.set(L"weather"));
     g_events.SaveSettings(c.set(L"events"));
+    PetSaveSettings(c.set(L"pet"));
     JVal& arr = c.set(L"widgets"); arr = JVal::MakeArr();
     for (auto& w : g_widgets) {
         JVal e = JVal::MakeObj();
@@ -484,6 +486,7 @@ static void LoadConfig() {
     g_uiTheme = g_cfg.str(L"settingsTheme", L"system");
     g_weather.LoadSettings(g_cfg.get(L"weather"));
     g_events.LoadSettings(g_cfg.get(L"events"));
+    PetLoadSettings(g_cfg.get(L"pet"));
 }
 
 // ------------------------------------------------------------------ placement
@@ -1355,6 +1358,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     LoadTodos();
     g_wallSig = g_wall.Signature();
     BuildWidgets();
+    PetInit();
     if (g_firstRun) SaveConfigNow(); else RequestSave();   // persist any clamping / migrated anchors
     bool showWelcome = g_firstRun;
     g_firstRun = false;   // custom widgets added from now on start enabled
@@ -1388,6 +1392,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     }
     if (g_dirWatch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(g_dirWatch);
     g_widgets.clear();
+    PetShutdown();
     g_media.Shutdown();
     g_weather.Shutdown();
     if (pn) UnregisterPowerSettingNotification(pn);

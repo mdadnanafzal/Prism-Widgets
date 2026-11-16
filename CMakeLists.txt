@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(PrismWidgets CXX RC)
 set(CMAKE_CXX_STANDARD 17)
-add_executable(PrismWidgets WIN32 src/app.cpp src/arrange.cpp src/settings.cpp src/widgets.cpp src/media.cpp src/weather.cpp src/events.cpp src/daypop.cpp src/net.cpp src/glass.cpp src/util.cpp src/json.cpp res/app.rc)
+add_executable(PrismWidgets WIN32 src/app.cpp src/arrange.cpp src/settings.cpp src/widgets.cpp src/media.cpp src/weather.cpp src/events.cpp src/daypop.cpp src/net.cpp src/glass.cpp src/util.cpp src/json.cpp src/pet/pet_rig.cpp src/pet/pet_draw.cpp src/pet/pet_brain.cpp src/pet/pet_input.cpp res/app.rc)
 target_compile_definitions(PrismWidgets PRIVATE UNICODE _UNICODE)
 target_link_libraries(PrismWidgets d2d1 dwrite windowscodecs ole32 uuid shell32 shlwapi shcore dwmapi wtsapi32 psapi runtimeobject winhttp advapi32 gdi32 user32)
 if(MSVC)
