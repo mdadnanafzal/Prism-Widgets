@@ -851,44 +851,55 @@ static Step WalkPath(std::vector<V2> pts) {
     return s;
 }
 
-// Way down 3: use the top edges of open windows as ledges: drop onto the highest ledge below,
-// walk along it toward home, step off its end, and so on down to the taskbar.
-struct Ledge { float l, r, y; };
+// Way down 3: the visible parts of open windows' top edges are ledges. It takes the route down with the
+// least walking (on each ledge it leaves by one end), then walks home along the taskbar.
 static std::vector<Ledge> Ledges() {
-    struct Ctx { std::vector<Ledge> out; RECT wa; DWORD pid; } c{ {}, W.work, GetCurrentProcessId() };
-    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+    struct Win { RECT r; bool ledge; };
+    struct Ctx { std::vector<Win> wins; DWORD pid; } c{ {}, GetCurrentProcessId() };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {   // front to back
         Ctx* c = (Ctx*)lp;
-        if (!IsWindowVisible(h) || IsIconic(h) || (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
-        DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
-        if (pid == c->pid) return TRUE;
+        if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
+        LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
+        if ((ex & WS_EX_LAYERED) && (ex & WS_EX_TRANSPARENT)) return TRUE;   // click-through overlays hide nothing
         BOOL cloaked = FALSE; DwmGetWindowAttribute(h, 14 /*DWMWA_CLOAKED*/, &cloaked, sizeof cloaked);
         if (cloaked) return TRUE;
+        DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+        bool own = pid == c->pid;   // Prism windows are never ledges, but its Settings window still hides edges
+        if (own) {
+            wchar_t cls[32] = {}; GetClassNameW(h, cls, 32);
+            if (!wcscmp(cls, L"PrismPet") || !wcscmp(cls, L"PrismPetFx")) return TRUE;
+        }
         RECT r;
         if (FAILED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof r))) GetWindowRect(h, &r);
-        if (r.right - r.left < 160 || r.bottom - r.top < 80) return TRUE;
-        if (r.top <= c->wa.top + 2 || r.top >= c->wa.bottom - 20) return TRUE;   // maximised windows and the taskbar: no ledge
-        float l = (float)std::max(r.left, c->wa.left), rr = (float)std::min(r.right, c->wa.right);
-        if (rr - l > 80) c->out.push_back({ l, rr, (float)r.top });
+        if (r.right <= r.left || r.bottom <= r.top) return TRUE;
+        bool ledge = !own && !(ex & WS_EX_TOOLWINDOW) && r.right - r.left >= 160 && r.bottom - r.top >= 80;
+        c->wins.push_back({ r, ledge });
         return TRUE;
     }, (LPARAM)&c);
-    return c.out;
+    std::vector<Ledge> out;
+    const RECT wa = W.work;
+    float minW = std::max(60.f, U(40));   // room to stand
+    for (size_t i = 0; i < c.wins.size(); i++) {
+        const RECT& r = c.wins[i].r;
+        if (!c.wins[i].ledge || r.top <= wa.top + 2 || r.top >= wa.bottom - 20) continue;   // maximised windows, the taskbar
+        float y = (float)r.top;
+        std::vector<Span> covers;   // windows in front that cover this edge
+        for (size_t k = 0; k < i; k++) {
+            const RECT& o = c.wins[k].r;
+            if (o.top < y - 1 && o.bottom > y) covers.push_back({ (float)o.left, (float)o.right });
+        }
+        for (Span sp : Uncovered((float)std::max(r.left, wa.left), (float)std::min(r.right, wa.right), covers))
+            if (sp.r - sp.l >= minW) out.push_back({ sp.l, sp.r, y });   // only the part on this screen
+    }
+    return out;
 }
 static Scene LedgePath() {
-    std::vector<Ledge> ledges = Ledges();
-    float x = W.p.x, y = W.st.floor, bottom = (float)W.work.bottom, m = U(14), home = C.homeX;
+    std::vector<LedgeStep> route = PlanLedgeRoute(Ledges(), W.p.x, W.st.floor, (float)W.work.bottom, U(14),
+                                                  (float)W.work.left, (float)W.work.right);
     Scene s;
-    for (int guard = 0; guard < 12 && y < bottom - 2; guard++) {
-        const Ledge* below = nullptr;   // the highest ledge under its feet
-        for (auto& L : ledges) if (L.y > y + 4 && x >= L.l + m && x <= L.r - m && (!below || L.y < below->y)) below = &L;
-        Append(s, DropTo(below ? below->y : bottom, 0, guard == 0));
-        if (!below) break;
-        y = below->y;
-        float dir = home >= x ? 1.f : -1.f, end = dir > 0 ? below->r : below->l;
-        if (home > below->l && home < below->r) {   // home is under this ledge: leave by the nearer end
-            end = home - below->l < below->r - home ? below->l : below->r; dir = end > x ? 1.f : -1.f;
-        }
-        x = end + dir * m;   // one step past the end, then down
-        s.push_back(Walk([x] { return x; }));
+    for (size_t i = 0; i < route.size(); i++) {
+        if (i) { float x = route[i].off; s.push_back(Walk([x] { return x; })); }   // to one step past the ledge's end
+        Append(s, DropTo(route[i].dropTo, 0, i == 0));
     }
     return s;
 }

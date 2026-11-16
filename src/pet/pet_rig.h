@@ -1,6 +1,7 @@
 // Prism Pet - skeleton, forward/inverse kinematics and stock poses (pure math, no Windows).
 #pragma once
 #include <cstdint>
+#include <vector>
 
 namespace pet {
 
@@ -58,5 +59,19 @@ void ArmIK(Pose& p, Side side, V2 target);   // elbow points back in the side vi
 void LegIK(Pose& p, Side side, V2 target);   // knee points forward in the side view, outward in the front view
 void Crouch(Pose& p, float depth, const Stage& s);   // depth in local units
 void WalkPose(Pose& p, float phase, const Stage& s);
+
+
+// ---- window-ledge route (pure geometry, screen px; y grows downward)
+struct Span { float l, r; };
+struct Ledge { float l, r, y; };          // a visible stretch of a window's top edge
+// Parts of [l, r] not covered by any span in `covers`.
+std::vector<Span> Uncovered(float l, float r, const std::vector<Span>& covers);
+// One move: walk along the current floor to `off` (a step past a ledge's end, or straight down at the
+// start), then fall to `dropTo`.
+struct LedgeStep { float off, dropTo; };
+// The route down from (x0, y0) to `bottom` with the least walking: on each ledge it leaves by one end,
+// stepping `m` past it, and lands on the highest ledge below that point. Ends within `m` of the screen
+// sides [left, right] can't be used.
+std::vector<LedgeStep> PlanLedgeRoute(const std::vector<Ledge>& ledges, float x0, float y0, float bottom, float m, float left, float right);
 
 }  // namespace pet

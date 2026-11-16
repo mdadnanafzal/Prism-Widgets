@@ -112,4 +112,66 @@ void WalkPose(Pose& p, float ph, const Stage& s) {
     p.y = s.StandY() + s.scale * LEG * (1 - std::cos(.45f * std::fabs(sF)));
 }
 
+
+std::vector<Span> Uncovered(float l, float r, const std::vector<Span>& covers) {
+    std::vector<Span> out{ { l, r } };
+    for (const Span& c : covers) {
+        std::vector<Span> next;
+        for (const Span& s : out) {
+            if (c.r <= s.l || c.l >= s.r) { next.push_back(s); continue; }
+            if (c.l > s.l) next.push_back({ s.l, c.l });
+            if (c.r < s.r) next.push_back({ c.r, s.r });
+        }
+        out.swap(next);
+    }
+    return out;
+}
+
+std::vector<LedgeStep> PlanLedgeRoute(const std::vector<Ledge>& L, float x0, float y0, float bottom, float m, float left, float right) {
+    auto landing = [&](float x, float y) {   // highest ledge below y with room for the feet at x, -1 = the taskbar
+        int best = -1;
+        for (int i = 0; i < (int)L.size(); i++)
+            if (L[i].y > y + 4 && x >= L[i].l + m * .5f && x <= L[i].r - m * .5f && (best < 0 || L[i].y < L[best].y)) best = i;
+        return best;
+    };
+    const float fallCost = .3f;   // falls are quick: they count a little, walking counts fully
+    // Dijkstra over exits: node 2i+e = leaving ledge i by its left (e = 0) or right (e = 1) end.
+    int n = 2 * (int)L.size(), done = n;   // node n = on the taskbar
+    std::vector<float> dist(n + 1, 1e30f); std::vector<int> prev(n + 1, -2), visited(n + 1, 0);
+    auto offOf = [&](int node) { const Ledge& e = L[node / 2]; return node % 2 ? e.r + m : e.l - m; };
+    auto relax = [&](int from, float base, float x, float y) {   // standing at (x, y) after a landing
+        int j = landing(x, y);
+        if (j < 0) {   // reached the taskbar
+            float c = base + fallCost * (bottom - y);
+            if (c < dist[done]) { dist[done] = c; prev[done] = from; }
+            return;
+        }
+        float fall = fallCost * (L[j].y - y);
+        for (int e = 0; e < 2; e++) {
+            int q = 2 * j + e; float end = e ? L[j].r : L[j].l, off = offOf(q);
+            if (off < left + m || off > right - m) continue;   // a screen side: no way down there
+            float c = base + fall + std::fabs(x - end) + m;
+            if (c < dist[q]) { dist[q] = c; prev[q] = from; }
+        }
+    };
+    relax(-1, 0, x0, y0);
+    for (;;) {
+        int u = -1;
+        for (int i = 0; i <= n; i++) if (!visited[i] && dist[i] < 1e29f && (u < 0 || dist[i] < dist[u])) u = i;
+        if (u < 0 || u == done) break;
+        visited[u] = 1;
+        relax(u, dist[u], offOf(u), L[u / 2].y);
+    }
+    std::vector<LedgeStep> route;
+    if (prev[done] == -2) return { { x0, bottom } };   // no route (all ends blocked): straight down
+    std::vector<int> exits;
+    for (int v = prev[done]; v >= 0; v = prev[v]) exits.push_back(v);
+    std::reverse(exits.begin(), exits.end());
+    float x = x0, y = y0;
+    auto fallFrom = [&](float fx, float fy) { int j = landing(fx, fy); return j < 0 ? bottom : L[j].y; };
+    route.push_back({ x, fallFrom(x, y) });   // the first drop, straight down
+    for (int v : exits) { x = offOf(v); y = L[v / 2].y; route.push_back({ x, fallFrom(x, y) }); }
+    return route;
+}
+
 }  // namespace pet

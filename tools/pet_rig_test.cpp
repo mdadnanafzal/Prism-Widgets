@@ -61,6 +61,28 @@ int main() {
     k = Kinematics(q);
     if (!(k.eF.x > (k.shF.x + k.hF.x) / 2 && k.eB.x < (k.shB.x + k.hB.x) / 2)) { printf("FAIL elbows not outward\n"); g_fail++; }
 
+    // Visible parts of an edge: covered stretches are cut out.
+    auto sp = Uncovered(0, 100, { { 20, 30 }, { 25, 40 }, { 90, 120 } });
+    if (sp.size() != 2 || sp[0].l != 0 || sp[0].r != 20 || sp[1].l != 40 || sp[1].r != 90) { printf("FAIL Uncovered\n"); g_fail++; }
+
+    // Ledge route (y grows downward; taskbar at 1000; screen 0..1920; step past an end = 10).
+    // Above ledge A near its right end: right end of A, onto B, B's left end (less walking than B's right), down.
+    std::vector<Ledge> L{ { 700, 1200, 450 }, { 1000, 1500, 650 }, { 1350, 1850, 820 } };
+    auto r1 = PlanLedgeRoute(L, 1150, 300, 1000, 10, 0, 1920);
+    bool ok1 = r1.size() == 3 && r1[0].off == 1150 && r1[0].dropTo == 450 && r1[1].off == 1210 && r1[1].dropTo == 650
+               && r1[2].off == 990 && r1[2].dropTo == 1000;
+    if (!ok1) { printf("FAIL staircase:"); for (auto& s : r1) printf(" (%.0f -> %.0f)", s.off, s.dropTo); printf("\n"); g_fail++; }
+    // Above A near its left end: the left end is nearer and goes straight to the taskbar.
+    auto r2 = PlanLedgeRoute(L, 750, 300, 1000, 10, 0, 1920);
+    if (!(r2.size() == 2 && r2[1].off == 690 && r2[1].dropTo == 1000)) { printf("FAIL nearer end\n"); g_fail++; }
+    // A ledge against the left screen side can only be left by its right end.
+    std::vector<Ledge> L2{ { 0, 400, 500 } };
+    auto r3 = PlanLedgeRoute(L2, 50, 300, 1000, 10, 0, 1920);
+    if (!(r3.size() == 2 && r3[1].off == 410)) { printf("FAIL screen side\n"); g_fail++; }
+    // Nothing below: straight down.
+    auto r4 = PlanLedgeRoute(L, 300, 300, 1000, 10, 0, 1920);
+    if (!(r4.size() == 1 && r4[0].dropTo == 1000)) { printf("FAIL straight down\n"); g_fail++; }
+
     // Pet height (sole to helmet top, helmet drawn at 0.9 scale) for the flower-pot size rule.
     float top = -(L_TORSO + L_NECK + L_HR) - 24.5f * .9f, height = STANDH - top;
     printf("pet height %.1f units, pot at 3.0x %.1f units (%.1f%% of the pet)\n", height, 35.6f * 3, 100 * 35.6f * 3 / height);
