@@ -95,3 +95,8 @@ void RegisterSettingsClass();
 void OpenSettings(Widget* focus = nullptr);
 void SettingsRefresh(bool widgetsChanged);   // called when state changes outside the window
 void CloseSettings();
+bool SettingsOpen();
+void OpenPetSettings();
+
+// Paused while the screen is locked or off, or a fullscreen app runs (app.cpp)
+bool Paused();

@@ -1,6 +1,7 @@
 // Arrange mode: a full-screen editing layer (dimmed wallpaper, dot grid, safe area, alignment guides)
 // with the widgets lifted above it and a floating toolbar. Everything here exists only while arranging.
 #include "app.h"
+#include "pet/pet.h"
 
 bool g_arranging = false;
 Widget* g_arrangeSel = nullptr;
@@ -255,6 +256,7 @@ void StartArrange() {
     Interactive();
     g_arranging = true;
     g_arrangeSel = nullptr;
+    PetArrange(true);
     BuildDimmedWallpaper();
     if (g_guideBrush) DeleteObject(g_guideBrush);
     g_guideBrush = CreateSolidBrush(AccentRef());
@@ -288,6 +290,7 @@ void EndArrange() {
     if (!g_arranging) return;
     g_arranging = false;
     g_arrangeSel = nullptr;
+    PetArrange(false);
     for (HWND g : O.guideWnds) DestroyWindow(g);
     if (O.bar) DestroyWindow(O.bar);
     if (O.wnd) DestroyWindow(O.wnd);

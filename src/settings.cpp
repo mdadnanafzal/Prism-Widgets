@@ -2,6 +2,7 @@
 // Custom-drawn with Direct2D (software) in an immediate-mode style: every paint lays out the page and
 // registers clickable regions. The window and all its buffers are freed when it is closed.
 #include "app.h"
+#include "pet/pet.h"
 #include <psapi.h>
 #include <shellscalingapi.h>
 
@@ -36,7 +37,7 @@ bool UiDark() {
     return v == 0;
 }
 
-enum Page { P_WIDGETS, P_DETAIL, P_APPEARANCE, P_GENERAL, P_CUSTOM, P_PERF };
+enum Page { P_WIDGETS, P_DETAIL, P_APPEARANCE, P_GENERAL, P_CUSTOM, P_PET, P_PERF };
 struct Hot { D2D1_RECT_F r; int id; std::function<void()> act; std::function<void(float, bool)> drag; };
 struct Preview { std::wstring key; std::vector<uint32_t> px; int w = 0, h = 0; float scale = 0; ID2D1Bitmap* bmp = nullptr; int gen = -1; };
 
@@ -289,7 +290,7 @@ void DrawSidebar(float H) {
 
     struct Item { Page p; wchar_t glyph; const wchar_t* name; };
     const Item items[] = { { P_WIDGETS, 0xE80A, L"Widgets" }, { P_APPEARANCE, 0xE790, L"Appearance" }, { P_GENERAL, 0xE713, L"General" },
-                           { P_CUSTOM, 0xE943, L"Custom widgets" }, { P_PERF, 0xE9D9, L"Performance" } };
+                           { P_CUSTOM, 0xE943, L"Custom widgets" }, { P_PET, 0xE99A, L"Desktop pet" }, { P_PERF, 0xE9D9, L"Performance" } };
     float y = 78;
     for (auto& it : items) {
         int id = NewId();
@@ -577,6 +578,118 @@ float PageCustom(float x0, float x1, float y) {
     return Group(x0, x1, y, L"", { ref });
 }
 
+// Comma-separated process names <-> list
+std::wstring JoinApps(const std::vector<std::wstring>& v) {
+    std::wstring s;
+    for (auto& a : v) { if (!s.empty()) s += L", "; s += a; }
+    return s;
+}
+std::vector<std::wstring> SplitApps(const std::wstring& s) {
+    std::vector<std::wstring> out; std::wstring cur;
+    auto flush = [&] {
+        size_t a = cur.find_first_not_of(L" \t"), b = cur.find_last_not_of(L" \t");
+        if (a != std::wstring::npos) out.push_back(cur.substr(a, b - a + 1));
+        cur.clear();
+    };
+    for (wchar_t c : s) { if (c == L',' || c == L';') flush(); else cur += c; }
+    flush();
+    return out;
+}
+// Edit box over a row, in screen px
+void EditAppsAt(D2D1_RECT_F r, std::vector<std::wstring>* list, const wchar_t* cue) {
+    POINT p{ (LONG)(r.left * S.s), (LONG)((r.top + 8) * S.s) };
+    ClientToScreen(S.hwnd, &p);
+    RECT rc{ p.x, p.y, p.x + (LONG)((r.right - r.left) * S.s), p.y + (LONG)(44 * S.s) };
+    ShowInputAt(rc, S.s, JoinApps(*list), cue, [list](const std::wstring& v) {
+        *list = SplitApps(v);
+        PetApplySettings();
+        if (S.hwnd) InvalidateRect(S.hwnd, nullptr, FALSE);
+    });
+}
+
+float PagePet(float x0, float x1, float y) {
+    PageHeader(x0, x1, y, L"Desktop pet", L"A small robot on your taskbar edge. It reacts to what you do and stays light on resources.");
+    PetSettings& c = PetConfig();
+    {   // preview in the current colours
+        D2D1_RECT_F pv = R(x0, y, x1, y + 168);
+        S.g->FillRound(pv, 14, S.p.card);
+        S.g->StrokeRound(R(pv.left + .5f, pv.top + .5f, pv.right - .5f, pv.bottom - .5f), 14, S.p.border, 1);
+        PetDrawPreview(S.g->rt, (x0 + x1) / 2, y + 146, 1.f);
+        y += 168 + 26;
+    }
+    std::vector<RowSpec> look;
+    look.push_back({ L"Show pet", L"", [&c](D2D1_RECT_F r) {
+        Toggle(r.right, (r.top + r.bottom) / 2, c.enabled, [&c] { c.enabled = !c.enabled; PetApplySettings(); }); } });
+    look.push_back({ L"Colour theme", L"An outline keeps it visible on the taskbar and dark wallpapers", [&c](D2D1_RECT_F r) {
+        int sel = c.theme == L"graphite" ? 1 : c.theme == L"sand" ? 2 : 0;
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Pearl", L"Graphite", L"Sand & Coral" }, sel, [&c](int i) {
+            c.theme = i == 1 ? L"graphite" : i == 2 ? L"sand" : L"pearl"; PetApplySettings(); }); } });
+    look.push_back({ L"Glow", L"Eyes, ear discs and chest light", [&c](D2D1_RECT_F r) {
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Theme colour", L"Accent colour" }, c.glow == L"accent" ? 1 : 0, [&c](int i) {
+            c.glow = i ? L"accent" : L"theme"; PetApplySettings(); }); } });
+    look.push_back({ L"Size", L"", [&c](D2D1_RECT_F r) {
+        float cy = (r.top + r.bottom) / 2;
+        wchar_t b[16]; swprintf(b, 16, L"%d%%", (int)std::lround(c.size * 100));
+        T(b, R(r.right - 52, cy - 12, r.right, cy + 12), 13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, S.p.text, 2);
+        Slider(r.right - 290, r.right - 66, cy, (c.size - .6f) / .9f, [&c](float t, bool done) {
+            c.size = Clamp(std::round((.6f + t * .9f) * 20) / 20, .6f, 1.5f);
+            if (done) PetApplySettings();
+        });
+    } });
+    look.push_back({ L"Home", L"Bottom-right of: " + PetHomeName() + L". Drag the pet anywhere; it walks home to code.", [](D2D1_RECT_F r) {
+        float bw = Button(r.right, (r.top + r.bottom) / 2, L"Main screen", false, [] { PetResetPosition(); });
+        Button(r.right - bw - 10, (r.top + r.bottom) / 2, L"Set to this screen", false, [] { PetSetHomeHere(); }); } });
+    y = Group(x0, x1, y, L"", look);
+
+    auto pick = [](const std::vector<float>& vals, float v) { int best = 0; for (int i = 0; i < (int)vals.size(); i++) if (std::fabs(vals[i] - v) < std::fabs(vals[best] - v)) best = i; return best; };
+    std::vector<RowSpec> beh;
+    beh.push_back({ L"Mischief", L"No clicks for this long (active time): a flower pot, then a cursor grab", [&c, pick](D2D1_RECT_F r) {
+        static const std::vector<float> v{ 15, 30, 60, 120 };
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"15 min", L"30 min", L"1 hour", L"2 hours" }, pick(v, c.mischiefMinutes), [&c](int i) {
+            c.mischiefMinutes = v[i]; PetApplySettings(); }); } });
+    beh.push_back({ L"Pacing when bored", L"Paces back and forth after standing still for a while", [&c](D2D1_RECT_F r) {
+        Toggle(r.right, (r.top + r.bottom) / 2, c.pacing, [&c] { c.pacing = !c.pacing; PetApplySettings(); }); } });
+    if (c.pacing) {
+        beh.push_back({ L"Bored after", L"", [&c, pick](D2D1_RECT_F r) {
+            static const std::vector<float> v{ 2, 5, 10, 15 };
+            Segmented(r.right, (r.top + r.bottom) / 2, { L"2 min", L"5 min", L"10 min", L"15 min" }, pick(v, c.pacingMinutes), [&c](int i) {
+                c.pacingMinutes = v[i]; PetApplySettings(); }); } });
+        beh.push_back({ L"Pacing range", L"Part of the screen width", [&c](D2D1_RECT_F r) {
+            int sel = c.pacingRange < .29f ? 0 : c.pacingRange < .42f ? 1 : 2;
+            Segmented(r.right, (r.top + r.bottom) / 2, { L"1/4", L"1/3", L"1/2" }, sel, [&c](int i) {
+                c.pacingRange = i == 0 ? .25f : i == 1 ? 1 / 3.f : .5f; PetApplySettings(); }); } });
+    }
+    beh.push_back({ L"Walk speed", L"Every walk: home, to the screen edge, pacing, under the cursor", [&c](D2D1_RECT_F r) {
+        int sel = c.walkSpeed < .85f ? 0 : c.walkSpeed > 1.2f ? 2 : 1;
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Slow", L"Normal", L"Fast" }, sel, [&c](int i) {
+            c.walkSpeed = i == 0 ? .7f : i == 2 ? 1.4f : 1.f; PetApplySettings(); }); } });
+    beh.push_back({ L"Cursor collision", L"The moving cursor can bump the pet over or knock it flying", [&c](D2D1_RECT_F r) {
+        Toggle(r.right, (r.top + r.bottom) / 2, c.collision, [&c] { c.collision = !c.collision; PetApplySettings(); }); } });
+    y = Group(x0, x1, y, L"Behaviour", beh);
+
+    std::vector<RowSpec> way;
+    RowSpec down{ L"Getting down", L"From above the taskbar. Portal: every trip home goes through a portal (quickest)", [&c](D2D1_RECT_F r) {
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Climb down", L"Jump down", L"Walk across", L"Window ledges", L"Portal" }, c.wayDown, [&c](int i) {
+            c.wayDown = i; PetApplySettings(); }); } };
+    down.stacked = true; down.h = 104;
+    way.push_back(down);
+    way.push_back({ L"On another screen", L"Go back through a portal, or make that screen's bottom-right its home", [&c](D2D1_RECT_F r) {
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"Portal home", L"Make it home" }, c.portalHome ? 0 : 1, [&c](int i) {
+            c.portalHome = i == 0; PetApplySettings(); }); } });
+    y = Group(x0, x1, y, L"Getting home", way);
+
+#if __has_include("pet/pet_dev.inc")
+#include "pet/pet_dev.inc"   // local testing options, not part of the project
+#endif
+
+    std::vector<RowSpec> apps;
+    apps.push_back({ L"Coding tools", JoinApps(c.codingApps), [&c](D2D1_RECT_F r) {
+        Button(r.right, (r.top + r.bottom) / 2, L"Edit", false, [r, &c] { EditAppsAt(r, &c.codingApps, L"Process names, separated by commas"); }); } });
+    apps.push_back({ L"Browsers", JoinApps(c.browserApps), [&c](D2D1_RECT_F r) {
+        Button(r.right, (r.top + r.bottom) / 2, L"Edit", false, [r, &c] { EditAppsAt(r, &c.browserApps, L"Process names, separated by commas"); }); } });
+    return Group(x0, x1, y, L"Apps it reacts to", apps);
+}
+
 struct PMC2 { DWORD cb, PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage,
               QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage, PrivateWorkingSetSize; ULONG64 SharedCommitUsage; };
 
@@ -620,6 +733,18 @@ float PagePerf(float x0, float x1, float y) {
         live.push_back({ L"Drag smoothness", L"Screen updates per second during the last drag or resize", val(r3) });
         live.push_back({ L"Power mode", L"Full speed while you use widgets, efficiency mode a few seconds after", val(g_perf.responsive ? L"Responsive" : L"Efficiency") });
         y = Group(x0, x1, y, L"Responsiveness", live);
+    }
+    {   // desktop pet
+        PetStats ps = PetGetStats();
+        wchar_t p1[64], p2[64];
+        if (ps.renderMs > 0) swprintf(p1, 64, L"%.2f ms avg", ps.renderMs); else wcscpy(p1, L"—");
+        if (!PetConfig().enabled) wcscpy(p2, L"Off"); else if (!ps.visible) wcscpy(p2, L"Paused"); else swprintf(p2, 64, L"%d fps", ps.fps);
+        std::vector<RowSpec> pet;
+        auto val = [](std::wstring v) { return [v](D2D1_RECT_F r) { T(v, r, 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, S.p.text, 2); }; };
+        pet.push_back({ L"Redraw time", L"How long one frame of the pet takes to draw", val(p1) });
+        pet.push_back({ L"Frame rate", L"30 while it moves, 12–15 while typing, scrolling or idle, less when asleep", val(p2) });
+        pet.push_back({ L"Mouse hook", L"Only during a cursor grab, or with collision on while the cursor is near the pet", val(ps.hook ? L"Installed" : L"Not installed") });
+        y = Group(x0, x1, y, L"Desktop pet", pet);
     }
     T(L"This Settings window adds a few MB while it is open. It is fully released when you close it; the widgets keep running.",
       R(x0 + 4, y, x1, y + 36), 12.5f, DWRITE_FONT_WEIGHT_NORMAL, S.p.text2, 0, false, true);
@@ -692,6 +817,7 @@ void Paint() {
             case P_APPEARANCE: end = PageAppearance(x0, x1, top); break;
             case P_GENERAL: end = PageGeneral(x0, x1, top); break;
             case P_CUSTOM: end = PageCustom(x0, x1, top); break;
+            case P_PET: end = PagePet(x0, x1, top); break;
             case P_PERF: end = PagePerf(x0, x1, top); break;
             }
             S.contentH = end + S.scroll + 20; S.viewH = H;
@@ -846,3 +972,5 @@ void SettingsRefresh(bool widgetsChanged) {
 }
 
 void CloseSettings() { if (S.hwnd) DestroyWindow(S.hwnd); }
+bool SettingsOpen() { return S.hwnd != nullptr; }
+void OpenPetSettings() { OpenSettings(); if (S.hwnd) { Go(P_PET); InvalidateRect(S.hwnd, nullptr, FALSE); } }
