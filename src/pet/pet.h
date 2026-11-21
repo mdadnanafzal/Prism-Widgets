@@ -15,6 +15,10 @@ struct PetSettings {
     float walkSpeed = 1;               // all walks: .7 slow, 1 normal, 1.4 fast
     int wayDown = 0;                   // from above the taskbar: 0 climb down, 1 jump down, 2 walk across the screen, 3 window ledges, 4 portal for every trip home
     bool portalHome = true;            // on another screen: portal back to the home screen (false: that screen becomes home)
+    bool onTop = true;                 // true: above all windows; false: desktop only, under windows like the widgets
+    bool fadeOverApps = true;          // on top: see-through and click-through while a maximized window is behind it
+    bool batteryPause = false;         // hide while the PC runs on battery
+    bool cursorGrab = false;           // mischief may grab the cursor (else only the flower pot)
     std::vector<std::wstring> codingApps, browserApps;   // process file names
 };
 PetSettings& PetConfig();
@@ -28,6 +32,9 @@ void PetSaveSettings(JVal& j);
 void PetInit(bool atLogin);            // after LoadConfig; atLogin: start asleep in bed and wake up
 void PetShutdown();
 void PetArrange(bool on);              // Arrange mode: the pet hides while it runs
+void PetPeek(bool on);                 // Peek: lift a desktop-only pet above windows with the widgets
+HWND PetHwnd();                        // the pet window while it is shown (else null)
+bool PetScreenRect(RECT& r);           // the pet's body on screen (px) while it is shown, so notification cards can avoid it
 
 enum class PetSession { Lock, Unlock, Suspend, Resume, EndSession };
 void PetOnSession(PetSession e);

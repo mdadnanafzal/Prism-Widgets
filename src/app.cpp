@@ -5,6 +5,7 @@
 #include "events.h"
 #include "net.h"
 #include "pet/pet.h"
+#include "update.h"
 #include <psapi.h>
 #include <algorithm>
 #include <shellscalingapi.h>
@@ -55,6 +56,7 @@ Ink MakeInk(const Theme& t, float lum) {
     float al = .2126f * k.accent.r + .7152f * k.accent.g + .0722f * k.accent.b;
     k.onAccent = al > .62f ? D2D1_COLOR_F{ .05f, .05f, .05f, 1 } : D2D1_COLOR_F{ 1, 1, 1, 1 };
     k.shadow = !t.panel && !dark;
+    k.radius = t.radius;
     // accent used as text: pull it toward the text colour when it would blend into the glass
     float d = std::fabs(al - lum);
     float mix = d < 0.40f ? (0.40f - d) / 0.40f * 0.85f : 0.f;
@@ -384,6 +386,7 @@ static void ScheduleTick() {
     SetTimer(g_main, T_TICK, std::max<UINT>(delay, 10), nullptr);
 }
 static void OnTick() {
+    for (auto& w : g_widgets) if (w->enabled && w->hwnd) w->Tick();
     if (!Paused()) {
         ULONGLONG now = GetTickCount64();
         for (auto& w : g_widgets) if (w->enabled && w->hwnd && (w->dirty || w->due <= now + 25)) Render(w.get());
@@ -413,28 +416,53 @@ static const JVal* EntryFor(const std::wstring& key) {
     for (auto& e : arr->a) if (e.str(L"key", L"") == key) return &e;
     return nullptr;
 }
+// Shown / position / size of one widget, as saved in config.json and in layout profiles
+static void ApplyPlacement(Widget* w, const JVal& e) {
+    w->enabled = e.boolean(L"enabled", true);
+    w->placed = e.get(L"x") != nullptr;
+    w->x = (int)e.num(L"x", 0); w->y = (int)e.num(L"y", 0);
+    w->size = (float)Clamp(e.num(L"size", 1.0), 0.5, 3.0);
+    w->cw = (float)e.num(L"w", 0); w->ch = (float)e.num(L"h", 0);
+    std::wstring a = e.str(L"anchor", L"");
+    w->hasAnchor = a.size() == 2;
+    if (w->hasAnchor) {
+        w->anchor = (a[1] == L'r' ? 1 : 0) | (a[0] == L'b' ? 2 : 0);
+        w->adx = (float)e.num(L"dx", 0); w->ady = (float)e.num(L"dy", 0);
+        w->mon = e.str(L"monitor", L"");
+    }
+}
+static JVal PlacementEntry(Widget* w) {
+    JVal e = JVal::MakeObj();
+    e.set(L"key") = JVal::MakeStr(w->key);
+    e.set(L"enabled") = JVal::MakeBool(w->enabled);
+    if (w->placed) { e.set(L"x") = JVal::MakeNum(w->x); e.set(L"y") = JVal::MakeNum(w->y); }
+    if (w->hasAnchor) {
+        const wchar_t* names[4] = { L"tl", L"tr", L"bl", L"br" };
+        e.set(L"anchor") = JVal::MakeStr(names[w->anchor & 3]);
+        e.set(L"dx") = JVal::MakeNum(std::round(w->adx * 10) / 10);
+        e.set(L"dy") = JVal::MakeNum(std::round(w->ady * 10) / 10);
+        e.set(L"monitor") = JVal::MakeStr(w->mon);
+    }
+    e.set(L"size") = JVal::MakeNum(std::round(w->size * 100) / 100);
+    if (w->cw > 0 || w->ch > 0) { D2D1_SIZE_F bs = w->BaseSize(); e.set(L"w") = JVal::MakeNum(std::round(bs.width)); e.set(L"h") = JVal::MakeNum(std::round(bs.height)); }
+    if (w->theme != w->DefaultTheme()) e.set(L"theme") = JVal::MakeStr(w->theme);
+    return e;
+}
+static JVal g_layouts = JVal::MakeArr();   // [{ "name", "widgets": [placement entries] }]
+std::wstring g_layout;
+
 static void ApplyEntry(Widget* w) {
     const JVal* e = EntryFor(w->key);
     if (!e) {
         // defaults: core widgets on, system off; customs off on first run (samples), on when user adds them later
-        if (w->key == L"system") w->enabled = false;
-        else if (w->IsCustom()) w->enabled = !g_firstRun;
+        static const wchar_t* offByDefault[] = { L"system", L"focus", L"note", L"worldclock", L"netspeed", L"photo" };
+        for (auto k : offByDefault) if (w->key == k) w->enabled = false;
+        if (w->IsCustom()) w->enabled = !g_firstRun;
         return;
     }
-    w->enabled = e->boolean(L"enabled", true);
-    w->placed = e->get(L"x") != nullptr;
-    w->x = (int)e->num(L"x", 0); w->y = (int)e->num(L"y", 0);
-    w->size = (float)Clamp(e->num(L"size", 1.0), 0.5, 3.0);
     if (e->get(L"theme")) w->theme = e->str(L"theme", L"");
     w->Load(*e);
-    w->cw = (float)e->num(L"w", 0); w->ch = (float)e->num(L"h", 0);
-    std::wstring a = e->str(L"anchor", L"");
-    if (a.size() == 2) {
-        w->hasAnchor = true;
-        w->anchor = (a[1] == L'r' ? 1 : 0) | (a[0] == L'b' ? 2 : 0);
-        w->adx = (float)e->num(L"dx", 0); w->ady = (float)e->num(L"dy", 0);
-        w->mon = e->str(L"monitor", L"");
-    }
+    ApplyPlacement(w, *e);
 }
 static void SaveConfigNow() {
     JVal c = JVal::MakeObj();
@@ -444,26 +472,19 @@ static void SaveConfigNow() {
     c.set(L"quickDrag") = JVal::MakeBool(g_quickDrag);
     c.set(L"snap") = JVal::MakeBool(g_snap);
     c.set(L"pauseFullscreen") = JVal::MakeBool(g_pauseFullscreen);
+    c.set(L"glassClarity") = JVal::MakeNum(g_glassClarity);
+    c.set(L"glassEdge") = JVal::MakeNum(g_glassEdge);
     c.set(L"settingsTheme") = JVal::MakeStr(g_uiTheme);
     g_weather.SaveSettings(c.set(L"weather"));
     g_events.SaveSettings(c.set(L"events"));
     PetSaveSettings(c.set(L"pet"));
+    g_update.SaveSettings(c.set(L"updates"));
+    c.set(L"peekKey") = JVal::MakeStr(g_peekKey);
+    c.set(L"layouts") = g_layouts;
+    c.set(L"layout") = JVal::MakeStr(g_layout);
     JVal& arr = c.set(L"widgets"); arr = JVal::MakeArr();
     for (auto& w : g_widgets) {
-        JVal e = JVal::MakeObj();
-        e.set(L"key") = JVal::MakeStr(w->key);
-        e.set(L"enabled") = JVal::MakeBool(w->enabled);
-        if (w->placed) { e.set(L"x") = JVal::MakeNum(w->x); e.set(L"y") = JVal::MakeNum(w->y); }
-        if (w->hasAnchor) {
-            const wchar_t* names[4] = { L"tl", L"tr", L"bl", L"br" };
-            e.set(L"anchor") = JVal::MakeStr(names[w->anchor & 3]);
-            e.set(L"dx") = JVal::MakeNum(std::round(w->adx * 10) / 10);
-            e.set(L"dy") = JVal::MakeNum(std::round(w->ady * 10) / 10);
-            e.set(L"monitor") = JVal::MakeStr(w->mon);
-        }
-        e.set(L"size") = JVal::MakeNum(std::round(w->size * 100) / 100);
-        if (w->cw > 0 || w->ch > 0) { D2D1_SIZE_F bs = w->BaseSize(); e.set(L"w") = JVal::MakeNum(std::round(bs.width)); e.set(L"h") = JVal::MakeNum(std::round(bs.height)); }
-        if (w->theme != w->DefaultTheme()) e.set(L"theme") = JVal::MakeStr(w->theme);
+        JVal e = PlacementEntry(w.get());
         w->Save(e);
         arr.a.push_back(e);
     }
@@ -483,10 +504,16 @@ static void LoadConfig() {
     g_quickDrag = g_cfg.boolean(L"quickDrag", false);
     g_snap = g_cfg.boolean(L"snap", true);
     g_pauseFullscreen = g_cfg.boolean(L"pauseFullscreen", true);
+    g_glassClarity = Clamp((int)g_cfg.num(L"glassClarity", 1), 0, 3);
+    g_glassEdge = Clamp((int)g_cfg.num(L"glassEdge", 1), 0, 2);
     g_uiTheme = g_cfg.str(L"settingsTheme", L"system");
     g_weather.LoadSettings(g_cfg.get(L"weather"));
     g_events.LoadSettings(g_cfg.get(L"events"));
     PetLoadSettings(g_cfg.get(L"pet"));
+    g_update.LoadSettings(g_cfg.get(L"updates"));
+    g_peekKey = g_cfg.str(L"peekKey", L"win+alt+w");
+    if (const JVal* l = g_cfg.get(L"layouts")) if (l->isArr()) g_layouts = *l;
+    g_layout = g_cfg.str(L"layout", L"");
 }
 
 // ------------------------------------------------------------------ placement
@@ -703,7 +730,7 @@ static void ShowWidget(Widget* w) {
         SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
         Render(w);
         ShowWindow(w->hwnd, SW_SHOWNOACTIVATE);
-        SetWindowPos(w->hwnd, g_arranging ? HWND_TOPMOST : HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(w->hwnd, (g_arranging || g_peeking) ? HWND_TOPMOST : HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     } else {
         SetWindowPos(w->hwnd, nullptr, w->x - w->margin, w->y - w->margin, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         Render(w);
@@ -718,6 +745,11 @@ static void BuildWidgets() {
     g_widgets.push_back(MakeTodo());
     g_widgets.push_back(MakeMedia());
     g_widgets.push_back(MakeSystem());
+    g_widgets.push_back(MakeFocus());
+    g_widgets.push_back(MakeNote());
+    g_widgets.push_back(MakeWorldClock());
+    g_widgets.push_back(MakeNetSpeed());
+    g_widgets.push_back(MakePhoto());
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((CustomWidgetDir() + L"\\*.json").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -787,6 +819,86 @@ static void OnWeatherChanged() {
     for (auto& w : g_widgets) if (w->key == L"weather" && w->enabled && w->hwnd) Render(w.get());
     SettingsRefresh(true);
 }
+// ------------------------------------------------------------------ layout profiles
+static JVal* FindLayout(const std::wstring& name) {
+    for (auto& l : g_layouts.a) if (l.str(L"name", L"") == name) return &l;
+    return nullptr;
+}
+std::vector<std::wstring> LayoutNames() { std::vector<std::wstring> v; for (auto& l : g_layouts.a) v.push_back(l.str(L"name", L"")); return v; }
+int LayoutWidgetCount(const std::wstring& name) {
+    JVal* l = FindLayout(name); int n = 0;
+    if (const JVal* ws = l ? l->get(L"widgets") : nullptr) for (auto& e : ws->a) if (e.boolean(L"enabled", true)) n++;
+    return n;
+}
+void SaveLayout(const std::wstring& nameIn) {
+    std::wstring name = nameIn;
+    while (!name.empty() && iswspace(name.back())) name.pop_back();
+    while (!name.empty() && iswspace(name.front())) name.erase(0, 1);
+    if (name.empty()) return;
+    if (name.size() > 40) name.resize(40);
+    JVal* l = FindLayout(name);
+    if (!l) { g_layouts.a.push_back(JVal::MakeObj()); l = &g_layouts.a.back(); }
+    *l = JVal::MakeObj();
+    l->set(L"name") = JVal::MakeStr(name);
+    JVal& ws = l->set(L"widgets"); ws = JVal::MakeArr();
+    for (auto& w : g_widgets) { if (w->enabled && !w->hasAnchor) UpdateAnchor(w.get()); ws.a.push_back(PlacementEntry(w.get())); }
+    l->set(L"pet") = JVal::MakeBool(PetConfig().enabled);
+    g_layout = name;
+    RequestSave(); SettingsRefresh(false);
+}
+void ApplyLayout(const std::wstring& name) {
+    JVal* l = FindLayout(name);
+    const JVal* ws = l ? l->get(L"widgets") : nullptr;
+    if (!ws || !ws->isArr()) return;
+    if (g_arranging) EndArrange();
+    EndPeek();
+    CloseDayPopup();
+    for (auto& w : g_widgets) {
+        const JVal* e = nullptr;
+        for (auto& x : ws->a) if (x.str(L"key", L"") == w->key) { e = &x; break; }
+        if (!e) { w->enabled = false; continue; }   // added after the layout was saved
+        ApplyPlacement(w.get(), *e);
+        w->theme = e->get(L"theme") ? e->str(L"theme", L"") : w->DefaultTheme();
+        w->bgValid = false;
+    }
+    for (auto& w : g_widgets) ShowWidget(w.get());
+    ResolveOverlaps(nullptr, true);
+    for (auto& w : g_widgets) if (w->enabled && !w->hasAnchor) UpdateAnchor(w.get());
+    g_layout = name;
+    if (const JVal* pe = l->get(L"pet")) if (pe->type == JVal::Bool && pe->b != PetConfig().enabled) { PetConfig().enabled = pe->b; PetApplySettings(); }
+    for (auto& w : g_widgets) if (w->key == L"media" && w->enabled) MediaKick(100);
+    Widget_RenderAll(true);
+    RequestSave(); SettingsRefresh(true);
+}
+void DeleteLayout(const std::wstring& name) {
+    for (size_t i = 0; i < g_layouts.a.size(); i++)
+        if (g_layouts.a[i].str(L"name", L"") == name) { g_layouts.a.erase(g_layouts.a.begin() + i); break; }
+    if (g_layout == name) g_layout.clear();
+    RequestSave(); SettingsRefresh(false);
+}
+
+// ------------------------------------------------------------------ updates: host side
+static int g_balloonPurpose = 0;
+void TrayBalloon(const std::wstring& title, const std::wstring& text, int purpose) {
+    NOTIFYICONDATAW n{ sizeof(n) };
+    n.hWnd = g_main; n.uID = 1; n.uFlags = NIF_INFO;
+    wcsncpy_s(n.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(n.szInfo, text.c_str(), _TRUNCATE);
+    n.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+    g_balloonPurpose = purpose;
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+void UpdateChanged() { SettingsRefresh(false); }
+void QuitForUpdate(const std::wstring& exe) {
+    SaveConfigNow();
+    std::wstring cmd = L"\"" + exe + L"\" --updated";
+    STARTUPINFOW si{ sizeof(si) }; PROCESS_INFORMATION pi{};
+    if (CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    DestroyWindow(g_main);   // the new copy waits for this one to exit
+}
+
 void ApplyGlobal(bool rebuildGlass) { Widget_RenderAll(rebuildGlass); RequestSave(); }
 void ResetPositions() {
     for (auto& w : g_widgets) { w->placed = false; w->hasAnchor = false; }
@@ -830,7 +942,7 @@ void OpenDataFolder() { ShellExecuteW(nullptr, L"open", AppDataDir().c_str(), nu
 
 // ------------------------------------------------------------------ input box (todo entry)
 struct InputState { HWND wnd = nullptr, edit = nullptr; WNDPROC oldProc = nullptr; HFONT font = nullptr; HBRUSH bg = nullptr;
-                    std::function<void(const std::wstring&)> done; bool closing = false; } g_input;
+                    std::function<void(const std::wstring&)> done; bool closing = false, multi = false; } g_input;
 
 static void CloseInput(bool commit) {
     if (!g_input.wnd || g_input.closing) return;
@@ -841,6 +953,11 @@ static void CloseInput(bool commit) {
         text.resize(n + 1); GetWindowTextW(g_input.edit, &text[0], n + 1); text.resize(n);
         while (!text.empty() && iswspace(text.back())) text.pop_back();
         while (!text.empty() && iswspace(text[0])) text.erase(0, 1);
+        if (g_input.multi) {   // store plain \n line breaks
+            std::wstring t; t.reserve(text.size());
+            for (wchar_t c : text) if (c != L'\r') t += c;
+            text.swap(t);
+        }
     }
     auto cb = std::move(g_input.done);
     DestroyWindow(g_input.wnd);
@@ -851,6 +968,14 @@ static void CloseInput(bool commit) {
 }
 static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     WNDPROC old = g_input.oldProc;
+    if (g_input.multi) {   // notes: Enter makes a new line; Ctrl+Enter or Esc saves; Ctrl+A selects all
+        bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        if (m == WM_KEYDOWN && ((wp == VK_RETURN && ctrl) || wp == VK_ESCAPE)) { CloseInput(true); return 0; }
+        if (m == WM_KEYDOWN && wp == 'A' && ctrl) { SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
+        if (m == WM_CHAR && (wp == 10 || wp == 27 || wp == 1)) return 0;
+        if (m == WM_KILLFOCUS) { LRESULT r = CallWindowProcW(old, h, m, wp, lp); PostMessageW(g_main, WM_APP + 9, 0, 0); return r; }
+        return CallWindowProcW(old, h, m, wp, lp);
+    }
     if (m == WM_KEYDOWN && wp == VK_RETURN) { CloseInput(true); return 0; }
     if (m == WM_KEYDOWN && wp == VK_ESCAPE) { CloseInput(false); return 0; }
     if (m == WM_CHAR && (wp == L'\r' || wp == 27)) return 0;
@@ -870,6 +995,28 @@ void ShowInput(Widget* w, D2D1_RECT_F lr, const std::wstring& init, std::functio
     float sc = w->scale * w->size;
     int x = w->x + (int)(lr.left * sc), y = w->y + (int)(lr.top * sc);
     ShowInputAt(RECT{ x, y, x + (int)((lr.right - lr.left) * sc), y + (int)((lr.bottom - lr.top) * sc) }, sc, init, L"Type and press Enter", std::move(done));
+}
+void ShowNoteInput(Widget* w, D2D1_RECT_F lr, const std::wstring& init, float fontSize, std::function<void(const std::wstring&)> done) {
+    float sc = w->scale * w->size;
+    int x = w->x + (int)(lr.left * sc), y = w->y + (int)(lr.top * sc);
+    RECT rc{ x, y, x + (int)((lr.right - lr.left) * sc), y + (int)((lr.bottom - lr.top) * sc) };
+    std::wstring t; t.reserve(init.size() + 16);
+    for (wchar_t c : init) { if (c == L'\n') t += L'\r'; t += c; }   // the edit control wants \r\n
+    ShowInputAt(rc, sc * fontSize / 14.f, t, L"", std::move(done));
+    if (!g_input.wnd) return;
+    // swap the single-line edit for a multi-line one filling the box
+    RECT cr; GetClientRect(g_input.wnd, &cr);
+    int pad = (int)(10 * sc);
+    DestroyWindow(g_input.edit);
+    g_input.multi = true;
+    g_input.edit = CreateWindowExW(0, L"EDIT", t.c_str(), WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
+                                   pad, pad, cr.right - 2 * pad, cr.bottom - 2 * pad, g_input.wnd, nullptr, g_inst, nullptr);
+    SendMessageW(g_input.edit, WM_SETFONT, (WPARAM)g_input.font, TRUE);
+    int n = GetWindowTextLengthW(g_input.edit);
+    SendMessageW(g_input.edit, EM_SETSEL, n, n);   // caret at the end
+    SendMessageW(g_input.edit, EM_SCROLLCARET, 0, 0);
+    g_input.oldProc = (WNDPROC)SetWindowLongPtrW(g_input.edit, GWLP_WNDPROC, (LONG_PTR)EditProc);
+    SetFocus(g_input.edit);
 }
 void ShowInputAt(RECT rc, float s, const std::wstring& init, const wchar_t* cue, std::function<void(const std::wstring&)> done) {
     CloseInput(false);
@@ -954,7 +1101,7 @@ static LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_WINDOWPOSCHANGING: {
         auto* p = (WINDOWPOS*)lp;
-        if (!g_arranging && !(p->flags & SWP_NOZORDER)) p->hwndInsertAfter = HWND_BOTTOM;   // stay on the desktop layer
+        if (!g_arranging && !g_peeking && !(p->flags & SWP_NOZORDER)) p->hwndInsertAfter = HWND_BOTTOM;   // stay on the desktop layer (except while arranging or peeking)
         return 0;
     }
     case WM_LBUTTONDBLCLK:
@@ -1165,6 +1312,17 @@ static void ShowTrayMenu() {
     AppendMenuW(xm, MF_STRING | (g_textMode == L"light" ? MF_CHECKED : 0), 1171, L"Light text");
     AppendMenuW(xm, MF_STRING | (g_textMode == L"dark" ? MF_CHECKED : 0), 1172, L"Dark text");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)xm, L"Text colour");
+    {
+        std::wstring pk = PeekKeyLabel();
+        AppendMenuW(m, MF_STRING, 1500, (L"Peek at widgets" + (pk.empty() ? std::wstring() : L"\t" + pk)).c_str());
+        HMENU lm = CreatePopupMenu();
+        auto names = LayoutNames();
+        for (size_t i = 0; i < names.size() && i < 40; i++) AppendMenuW(lm, MF_STRING | (names[i] == g_layout ? MF_CHECKED : 0), 1510 + i, names[i].c_str());
+        if (names.empty()) AppendMenuW(lm, MF_STRING | MF_GRAYED, 0, L"No saved layouts yet");
+        AppendMenuW(lm, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(lm, MF_STRING, 1501, L"Save or manage layouts\u2026");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)lm, L"Layouts");
+    }
     AppendMenuW(m, MF_STRING | (PetConfig().enabled ? MF_CHECKED : 0), 1400, L"Show pet");
     AppendMenuW(m, MF_STRING, 1401, L"Pet settings…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -1172,6 +1330,7 @@ static void ShowTrayMenu() {
     AppendMenuW(m, MF_STRING, 1181, L"Reset widget positions");
     AppendMenuW(m, MF_STRING | (IsStartup() ? MF_CHECKED : 0), 1182, L"Start with Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 1502, g_update.state == Updater::Available ? (L"Update to " + g_update.version + L"\u2026").c_str() : L"Check for updates\u2026");
     AppendMenuW(m, MF_STRING, 1190, L"Help");
     AppendMenuW(m, MF_STRING, 1199, L"Exit");
     POINT pt; GetCursorPos(&pt);
@@ -1197,6 +1356,10 @@ static void ShowTrayMenu() {
     else if (id == 1302) ReloadCustom();
     else if (id == 1400) { PetConfig().enabled = !PetConfig().enabled; PetApplySettings(); }
     else if (id == 1401) { OpenPetSettings(); return; }
+    else if (id == 1500) { StartPeek(); return; }
+    else if (id == 1501) { OpenSettings(); OpenLayoutSettings(); return; }
+    else if (id == 1502) { if (g_update.state != Updater::Available) g_update.Check(true); OpenUpdateSettings(); return; }
+    else if (id >= 1510 && id < 1550) { auto names = LayoutNames(); if (id - 1510 < (int)names.size()) ApplyLayout(names[id - 1510]); return; }
     SettingsRefresh(true);
 }
 
@@ -1241,6 +1404,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             if (!g_arranging && !g_drag.down && !OurWindowInFront()) { ReleaseCaches(); TrimMemory(); }
             else SetTimer(h, T_DEEPIDLE, 10 * 60 * 1000, nullptr);
             break;
+        case UPDATE_TIMER_ID: g_update.OnTimer(); break;
+        case REMINDER_TIMER_ID: RemindersTick(); break;
         case EVENTS_TIMER_ID: {
             bool on = false; for (auto& w : g_widgets) if (w->key == L"calendar" && w->enabled) on = true;
             if (on && !Paused()) g_events.Refresh(false);
@@ -1255,11 +1420,15 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         }
         return 0;
+    case WM_HOTKEY:
+        if (IsPeekHotkey(wp)) TogglePeek();
+        return 0;
     case WM_TRAY:
         Interactive();
         switch (LOWORD(lp)) {
         case WM_CONTEXTMENU: ShowTrayMenu(); break;
         case NIN_SELECT: case NIN_KEYSELECT: OpenSettings(); break;
+        case NIN_BALLOONUSERCLICK: if (g_balloonPurpose == 1) OpenUpdateSettings(); break;
         }
         return 0;
     case WM_SHOWSETTINGS: OpenSettings(); return 0;
@@ -1299,6 +1468,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         else if (wp == PBT_APMRESUMEAUTOMATIC) { Widget_RenderAll(false); SetTimer(h, WEATHER_TIMER_ID, 15000, nullptr); PetOnSession(PetSession::Resume); }   // fresh weather after sleep
         return TRUE;
     case WM_DESTROY:
+        EndPeek();
+        CloseReminders();
         CloseDayPopup();
         EndArrange();
         CloseSettings();
@@ -1319,7 +1490,13 @@ static void BeLightweight() {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     g_inst = inst;
+    bool updated = cmd && wcsstr(cmd, L"--updated");
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\PrismWidgets.Singleton");
+    for (int i = 0; updated && GetLastError() == ERROR_ALREADY_EXISTS && i < 100; i++) {   // the old version is still closing
+        if (mtx) CloseHandle(mtx);
+        Sleep(100);
+        mtx = CreateMutexW(nullptr, TRUE, L"Local\\PrismWidgets.Singleton");
+    }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         // Already running: bring up its Settings window instead of starting twice
         HWND other = FindWindowW(L"PrismWidgetsMain", nullptr);
@@ -1337,7 +1514,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
 
     bool startup = cmd && wcsstr(cmd, L"--startup");
     bool arrange = cmd && wcsstr(cmd, L"--arrange");
-    bool hidden = startup || arrange || (cmd && wcsstr(cmd, L"--hidden"));
+    bool hidden = startup || arrange || updated || (cmd && wcsstr(cmd, L"--hidden"));
     if (startup) for (int i = 0; i < 60 && !FindWindowW(L"Progman", nullptr); i++) Sleep(500);   // wait for Explorer
 
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -1366,6 +1543,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     g_wallSig = g_wall.Signature();
     BuildWidgets();
     PetInit(startup);
+    RegisterPeekKey();
+    g_update.Start(updated);
+    SetTimer(g_main, REMINDER_TIMER_ID, 30 * 1000, nullptr);
     if (g_firstRun) SaveConfigNow(); else RequestSave();   // persist any clamping / migrated anchors
     bool showWelcome = g_firstRun;
     g_firstRun = false;   // custom widgets added from now on start enabled

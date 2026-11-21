@@ -32,6 +32,11 @@ public:
     std::wstring holStatus, syncStatus;
     long long holTime = 0, syncTime = 0;
     int holCount = 0, syncCount = 0;
+    int remindMins = 10;                 // reminder lead for timed events; 0 = off
+    bool remindAllDay = true;            // morning reminder for your all-day events and birthdays
+    bool remindSound = true;
+    int remindedDay = 0;                 // reminders already shown today (so a restart doesn't repeat them)
+    std::vector<std::wstring> reminded;
 
     void LoadSettings(const JVal* o);
     void SaveSettings(JVal& o) const;
@@ -76,3 +81,9 @@ void EventsChanged();   // app.cpp (posted): redraw calendars, Settings and the 
 void ShowDayPopup(int day, RECT anchor);
 void RefreshDayPopup();
 void CloseDayPopup();
+
+// Reminders (reminders.cpp)
+#define REMINDER_TIMER_ID 61
+void RemindersTick();
+void ShowTestReminder();
+void CloseReminders();

@@ -29,7 +29,7 @@
 
 #define APP_NAME     L"Prism Widgets"
 #define APP_ID       L"PrismWidgets"
-#define APP_VERSION  L"1.7.0"
+#define APP_VERSION  L"1.9.2"
 
 template <class T> inline void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 template <class T> inline T Clamp(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -102,7 +102,11 @@ struct Theme {
     float shadow;       // drop shadow opacity
     float shadowSize;   // DIP
     float noise;        // acrylic grain
+    float squircle = 0; // >0: continuous-curvature ("squircle") corners with this exponent, plus the glass-lens edge model
 };
+// Liquid Glass fine-tuning (Settings -> Appearance)
+extern int g_glassClarity;   // 0 clear, 1 default, 2 soft, 3 frosted
+extern int g_glassEdge;      // 0 subtle, 1 normal, 2 strong
 extern const Theme g_themes[];
 extern const int g_themeCount;
 const Theme& FindTheme(const std::wstring& id);

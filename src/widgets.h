@@ -35,6 +35,7 @@ struct Ink {
     D2D1_COLOR_F fg, fg2, fg3, accent, onAccent, hover;
     D2D1_COLOR_F accentText;   // accent adjusted for contrast against the glass behind it
     bool shadow = false;   // draw soft text shadow (clear theme)
+    float radius = 16;     // panel corner radius (DIP) of the current theme
 };
 
 inline D2D1_COLOR_F Alpha(D2D1_COLOR_F c, float a) { c.a *= a; return c; }
@@ -107,6 +108,7 @@ public:
     bool ResizableH() { return MaxSize().height > MinSize().height; }
     virtual void Draw(Gfx& g, float W, float H) = 0;
     virtual int  Interval() { return 60000; }        // 1000 / 60000 = aligned to second / minute
+    virtual void Tick() {}                           // every scheduler pass, even while paused (timers, slideshows); set `dirty` to redraw
     virtual bool Click(float, float) { return false; }
     // B3: instant press feedback. HitId says which pressable part is under a point.
     virtual bool HitId(float, float, int&) { return false; }
@@ -134,6 +136,11 @@ std::unique_ptr<Widget> MakeWeather();
 std::unique_ptr<Widget> MakeMedia();
 std::unique_ptr<Widget> MakeSystem();
 std::unique_ptr<Widget> MakeCustom(const std::wstring& file);
+std::unique_ptr<Widget> MakeFocus();
+std::unique_ptr<Widget> MakeNote();
+std::unique_ptr<Widget> MakeWorldClock();
+std::unique_ptr<Widget> MakeNetSpeed();
+std::unique_ptr<Widget> MakePhoto();
 void LoadTodos();
 void WriteSampleWidgets();
 
@@ -141,3 +148,7 @@ void WriteSampleWidgets();
 void RequestRedraw(Widget* w);
 void RequestSave();
 void ShowInput(Widget* w, D2D1_RECT_F localRect, const std::wstring& init, std::function<void(const std::wstring&)> done);
+// multi-line editor over a widget: Enter = new line, Ctrl+Enter / Esc / clicking away saves
+void ShowNoteInput(Widget* w, D2D1_RECT_F localRect, const std::wstring& init, float fontSize, std::function<void(const std::wstring&)> done);
+// small glass card in the bottom-right corner (reminders.cpp)
+void ShowToast(const std::wstring& head, const std::wstring& title, wchar_t glyph, bool sound);

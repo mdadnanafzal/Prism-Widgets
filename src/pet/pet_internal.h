@@ -128,6 +128,7 @@ void OnContact(float vx, float vy);
 void SetFrameRate(int fps);
 bool Dragging();
 RECT PetHitBox();          // screen px
+bool KeepAtBottom();       // desktop-only layer: the window stays under every other window
 HWND PetWindow();
 
 // ---------------------------------------------------------------- effects (pet_fx.cpp)
@@ -153,6 +154,7 @@ struct Surface {
     ID2D1DCRenderTarget* rt = nullptr; ID2D1SolidColorBrush* br = nullptr;
     POINT org{}; bool placed = false;   // window position; it stays put while `box` fits inside
     int oversized = 0;                  // frames in a row the surface was much bigger than needed
+    BYTE alpha = 255;                   // whole-window opacity (see-through modes)
     void Free();
 };
 // Renders `draw` (in screen px) into a layered window that covers the screen rect `box` (premultiplied BGRA).

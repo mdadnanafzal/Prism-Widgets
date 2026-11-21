@@ -3,6 +3,7 @@
 // registers clickable regions. The window and all its buffers are freed when it is closed.
 #include "app.h"
 #include "pet/pet.h"
+#include "update.h"
 #include <psapi.h>
 #include <shellscalingapi.h>
 
@@ -499,6 +500,19 @@ float PageAppearance(float x0, float x1, float y) {
     acc.stacked = true; acc.h = 120;
     y = Group(x0, x1, y, L"", { acc });
 
+    {   // Liquid Glass fine-tuning
+        std::vector<RowSpec> lg;
+        lg.push_back({ L"Clarity", L"How much the glass blurs what's behind it", [](D2D1_RECT_F r) {
+            Segmented(r.right, (r.top + r.bottom) / 2, { L"Clear", L"Default", L"Soft", L"Frosted" }, g_glassClarity, [](int i) {
+                g_glassClarity = i; GlobalChanged(true, true); });
+        } });
+        lg.push_back({ L"Edge refraction", L"How strongly the rounded glass edge bends the wallpaper", [](D2D1_RECT_F r) {
+            Segmented(r.right, (r.top + r.bottom) / 2, { L"Subtle", L"Normal", L"Strong" }, g_glassEdge, [](int i) {
+                g_glassEdge = i; GlobalChanged(true, true); });
+        } });
+        y = Group(x0, x1, y, L"Liquid Glass", lg);
+    }
+
     std::vector<RowSpec> rows;
     rows.push_back({ L"Text on widgets", L"Automatic picks light or dark text from the wallpaper behind each widget", [](D2D1_RECT_F r) {
         int sel = g_textMode == L"light" ? 1 : g_textMode == L"dark" ? 2 : 0;
@@ -511,6 +525,21 @@ float PageAppearance(float x0, float x1, float y) {
             g_uiTheme = i == 0 ? L"system" : i == 1 ? L"light" : L"dark"; ApplyFrame(); RequestSave(); });
     } });
     return Group(x0, x1, y, L"", rows);
+}
+
+std::wstring g_scrollTo;   // "layouts" or "updates": scroll there on the next paint of General
+void ScrollHere(const wchar_t* what, float y) {
+    if (g_scrollTo != what) return;
+    g_scrollTo.clear();
+    S.scroll = std::max(0.f, S.scroll + y - 40);
+    InvalidateRect(S.hwnd, nullptr, FALSE);
+}
+// A text box over a settings row (screen px), for a name
+void AskAt(D2D1_RECT_F r, const std::wstring& init, const wchar_t* cue, std::function<void(const std::wstring&)> done) {
+    POINT p{ (LONG)((r.left) * S.s), (LONG)((r.top + 8) * S.s) };
+    ClientToScreen(S.hwnd, &p);
+    RECT rc{ p.x, p.y, p.x + (LONG)((r.right - r.left) * S.s), p.y + (LONG)(44 * S.s) };
+    ShowInputAt(rc, S.s, init, cue, std::move(done));
 }
 
 float PageGeneral(float x0, float x1, float y) {
@@ -529,12 +558,77 @@ float PageGeneral(float x0, float x1, float y) {
     desk.push_back({ L"Reset all widget positions", L"Stacks visible widgets on the right of your main screen", [](D2D1_RECT_F r) {
         Button(r.right, (r.top + r.bottom) / 2, L"Reset", false, [] { ResetPositions(); }); } });
     y = Group(x0, x1, y, L"Desktop", desk);
+
+    // ---- peek
+    std::vector<RowSpec> pk;
+    RowSpec key{ L"Peek at your widgets", g_peekKeyOk ? L"Lifts the widgets above every window. Press it again, Esc or click anywhere to go back."
+                                                      : L"That shortcut is already used by another app. Pick another one.", [](D2D1_RECT_F r) {
+        std::vector<std::wstring> ch = { L"Win + Alt + W", L"Ctrl + Alt + W", L"Ctrl + Shift + Space", L"Off" };
+        int sel = g_peekKey == L"ctrl+alt+w" ? 1 : g_peekKey == L"ctrl+shift+space" ? 2 : g_peekKey == L"off" ? 3 : 0;
+        Segmented(r.left + SegmentedWidth(ch), (r.top + r.bottom) / 2, ch, sel, [](int i) {
+            static const wchar_t* v[] = { L"win+alt+w", L"ctrl+alt+w", L"ctrl+shift+space", L"off" };
+            g_peekKey = v[i]; RegisterPeekKey(); RequestSave();
+        });
+    } };
+    key.stacked = true; key.h = 108;
+    if (!g_peekKeyOk) key.hintColor = S.p.danger;
+    pk.push_back(key);
+    pk.push_back({ L"Try it", L"", [](D2D1_RECT_F r) { Button(r.right, (r.top + r.bottom) / 2, L"Peek now", false, [] { StartPeek(); }, 0xE890); } });
+    y = Group(x0, x1, y, L"Peek", pk);
+
+    // ---- layout profiles
+    ScrollHere(L"layouts", y);
+    std::vector<RowSpec> lay;
+    for (auto& name : LayoutNames()) {
+        bool active = name == g_layout;
+        int n = LayoutWidgetCount(name);
+        std::wstring hint = std::to_wstring(n) + (n == 1 ? L" widget" : L" widgets") + (active ? L" \u00B7 applied last" : L"");
+        lay.push_back({ name, hint, [name, active](D2D1_RECT_F r) {
+            float cy = (r.top + r.bottom) / 2, x = r.right;
+            x -= Button(x, cy, L"Apply", !active, [name] { ApplyLayout(name); }) + 8;
+            x -= Button(x, cy, L"Update", false, [name] { SaveLayout(name); }) + 8;
+            Button(x, cy, L"Delete", false, [name] { DeleteLayout(name); });
+        } });
+    }
+    lay.push_back({ L"Save the current layout", L"Which widgets show, where they sit on each screen, their size and theme", [](D2D1_RECT_F r) {
+        Button(r.right, (r.top + r.bottom) / 2, L"Save as new\u2026", true, [r] {
+            AskAt(r, L"", L"Name it, e.g. Work, Gaming or Minimal", [](const std::wstring& v) { SaveLayout(v); });
+        }, 0xE710);
+    } });
+    y = Group(x0, x1, y, L"Layout profiles", lay);
+
     y = Group(x0, x1, y, L"Games & fullscreen", { { L"Pause during fullscreen apps and games", L"Widgets stop updating completely so they never cost you FPS", [](D2D1_RECT_F r) {
         Toggle(r.right, (r.top + r.bottom) / 2, g_pauseFullscreen, [] { g_pauseFullscreen = !g_pauseFullscreen; RequestSave(); }); } } });
     std::vector<RowSpec> data;
     data.push_back({ L"Data folder", L"Settings, to-do list and custom widgets", [](D2D1_RECT_F r) {
         Button(r.right, (r.top + r.bottom) / 2, L"Open", false, [] { OpenDataFolder(); }); } });
-    return Group(x0, x1, y, L"Data", data);
+    y = Group(x0, x1, y, L"Data", data);
+
+    // ---- updates
+    ScrollHere(L"updates", y);
+    std::vector<RowSpec> up;
+    Updater::State st = g_update.state;
+    bool canInstall = st == Updater::Available || (st == Updater::Failed && !g_update.version.empty() && CompareVersions(g_update.version, APP_VERSION) > 0);
+    RowSpec ver{ L"Prism Widgets " APP_VERSION, g_update.Status(), [st, canInstall](D2D1_RECT_F r) {
+        float cy = (r.top + r.bottom) / 2;
+        if (canInstall) Button(r.right, cy, L"Update now", true, [] { g_update.Install(); }, 0xE896);
+        else if (st != Updater::Checking && st != Updater::Downloading && st != Updater::Ready)
+            Button(r.right, cy, L"Check now", false, [] { g_update.Check(true); }, 0xE72C);
+    } };
+    if (st == Updater::Failed) ver.hintColor = S.p.danger;
+    up.push_back(ver);
+    if (canInstall && !g_update.notes.empty()) {
+        int lines = 1; for (wchar_t c : g_update.notes) if (c == L'\n') lines++;
+        lines += (int)g_update.notes.size() / 90;
+        RowSpec notes{ L"What's new in " + g_update.version, L"", [](D2D1_RECT_F r) {
+            T(g_update.notes, r, 13, DWRITE_FONT_WEIGHT_NORMAL, S.p.text2, 0, false, true);
+        } };
+        notes.stacked = true; notes.h = 52 + 19.f * std::min(lines, 12);
+        up.push_back(notes);
+    }
+    up.push_back({ L"Check for updates automatically", L"About once a day, quietly. You decide when to install.", [](D2D1_RECT_F r) {
+        Toggle(r.right, (r.top + r.bottom) / 2, g_update.autoCheck, [] { g_update.autoCheck = !g_update.autoCheck; RequestSave(); }); } });
+    return Group(x0, x1, y, L"Updates", up);
 }
 
 float PageCustom(float x0, float x1, float y) {
@@ -636,6 +730,12 @@ float PagePet(float x0, float x1, float y) {
             if (done) PetApplySettings();
         });
     } });
+    look.push_back({ L"Where it lives", c.onTop ? L"Above all windows, standing on the taskbar edge" : L"On the desktop with the widgets, under your windows (Peek shows it too)", [&c](D2D1_RECT_F r) {
+        Segmented(r.right, (r.top + r.bottom) / 2, { L"On top of windows", L"Desktop only" }, c.onTop ? 0 : 1, [&c](int i) {
+            c.onTop = i == 0; PetApplySettings(); }); } });
+    if (c.onTop)
+        look.push_back({ L"Fade over maximized apps", L"Goes see-through and click-through so it never hides buttons. Hold Ctrl over it to see through it anytime.", [&c](D2D1_RECT_F r) {
+            Toggle(r.right, (r.top + r.bottom) / 2, c.fadeOverApps, [&c] { c.fadeOverApps = !c.fadeOverApps; PetApplySettings(); }); } });
     look.push_back({ L"Home", L"Bottom-right of: " + PetHomeName() + L". Drag the pet anywhere; it walks home to code.", [](D2D1_RECT_F r) {
         float bw = Button(r.right, (r.top + r.bottom) / 2, L"Main screen", false, [] { PetResetPosition(); });
         Button(r.right - bw - 10, (r.top + r.bottom) / 2, L"Set to this screen", false, [] { PetSetHomeHere(); }); } });
@@ -643,10 +743,12 @@ float PagePet(float x0, float x1, float y) {
 
     auto pick = [](const std::vector<float>& vals, float v) { int best = 0; for (int i = 0; i < (int)vals.size(); i++) if (std::fabs(vals[i] - v) < std::fabs(vals[best] - v)) best = i; return best; };
     std::vector<RowSpec> beh;
-    beh.push_back({ L"Mischief", L"No clicks for this long (active time): a flower pot, then a cursor grab", [&c, pick](D2D1_RECT_F r) {
+    beh.push_back({ L"Mischief", L"No clicks for this long (active time): a prank. Never while you type or during a call (camera or mic in use)", [&c, pick](D2D1_RECT_F r) {
         static const std::vector<float> v{ 15, 30, 60, 120 };
         Segmented(r.right, (r.top + r.bottom) / 2, { L"15 min", L"30 min", L"1 hour", L"2 hours" }, pick(v, c.mischiefMinutes), [&c](int i) {
             c.mischiefMinutes = v[i]; PetApplySettings(); }); } });
+    beh.push_back({ L"Cursor grab", L"Every other prank, it grabs your cursor for a few seconds (Esc lets go). Off: only the flower pot", [&c](D2D1_RECT_F r) {
+        Toggle(r.right, (r.top + r.bottom) / 2, c.cursorGrab, [&c] { c.cursorGrab = !c.cursorGrab; PetApplySettings(); }); } });
     beh.push_back({ L"Pacing when bored", L"Paces back and forth after standing still for a while", [&c](D2D1_RECT_F r) {
         Toggle(r.right, (r.top + r.bottom) / 2, c.pacing, [&c] { c.pacing = !c.pacing; PetApplySettings(); }); } });
     if (c.pacing) {
@@ -665,6 +767,8 @@ float PagePet(float x0, float x1, float y) {
             c.walkSpeed = i == 0 ? .7f : i == 2 ? 1.4f : 1.f; PetApplySettings(); }); } });
     beh.push_back({ L"Cursor collision", L"The moving cursor can bump the pet over or knock it flying", [&c](D2D1_RECT_F r) {
         Toggle(r.right, (r.top + r.bottom) / 2, c.collision, [&c] { c.collision = !c.collision; PetApplySettings(); }); } });
+    beh.push_back({ L"Pause on battery", L"Hides the pet while your laptop is unplugged", [&c](D2D1_RECT_F r) {
+        Toggle(r.right, (r.top + r.bottom) / 2, c.batteryPause, [&c] { c.batteryPause = !c.batteryPause; PetApplySettings(); }); } });
     y = Group(x0, x1, y, L"Behaviour", beh);
 
     std::vector<RowSpec> way;
@@ -742,7 +846,7 @@ float PagePerf(float x0, float x1, float y) {
         std::vector<RowSpec> pet;
         auto val = [](std::wstring v) { return [v](D2D1_RECT_F r) { T(v, r, 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, S.p.text, 2); }; };
         pet.push_back({ L"Redraw time", L"How long one frame of the pet takes to draw", val(p1) });
-        pet.push_back({ L"Frame rate", L"30 while it moves, 12–15 while typing, scrolling or idle, less when asleep", val(p2) });
+        pet.push_back({ L"Frame rate", L"30 while it moves; 5–8 when it has been resting for 20 s (12–15 just after); 0 when hidden", val(p2) });
         pet.push_back({ L"Mouse hook", L"Only during a cursor grab, or with collision on while the cursor is near the pet", val(ps.hook ? L"Installed" : L"Not installed") });
         y = Group(x0, x1, y, L"Desktop pet", pet);
     }
@@ -973,4 +1077,6 @@ void SettingsRefresh(bool widgetsChanged) {
 
 void CloseSettings() { if (S.hwnd) DestroyWindow(S.hwnd); }
 bool SettingsOpen() { return S.hwnd != nullptr; }
+void OpenUpdateSettings() { OpenSettings(); if (S.hwnd) { Go(P_GENERAL); g_scrollTo = L"updates"; InvalidateRect(S.hwnd, nullptr, FALSE); } }
+void OpenLayoutSettings() { OpenSettings(); if (S.hwnd) { Go(P_GENERAL); g_scrollTo = L"layouts"; InvalidateRect(S.hwnd, nullptr, FALSE); } }
 void OpenPetSettings() { OpenSettings(); if (S.hwnd) { Go(P_PET); InvalidateRect(S.hwnd, nullptr, FALSE); } }

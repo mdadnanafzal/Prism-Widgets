@@ -30,9 +30,11 @@ bool FxActive() { return s_wnd != nullptr; }
 
 void FxThrow(V2 from, V2 to, float scale) {
     Release();
-    s_wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"PrismPetFx", L"",
-                            WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, g_inst, nullptr);
+    bool top = !KeepAtBottom();   // the effect sits on the same layer as the pet
+    s_wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | (top ? WS_EX_TOPMOST : 0) | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"PrismPetFx", L"",
+                            WS_POPUP, 0, 0, 0, 0, top ? nullptr : FindWindowW(L"Progman", nullptr), nullptr, g_inst, nullptr);
     if (!s_wnd) return;
+    if (!top) SetWindowPos(s_wnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     ShowWindow(s_wnd, SW_SHOWNOACTIVATE);
     s_flying = true; s_t = 0; s_time = 0; s_flash = 0;
     s_x0 = from.x; s_y0 = from.y; s_x1 = to.x; s_y1 = to.y;

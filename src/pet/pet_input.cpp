@@ -12,6 +12,11 @@ static POINT g_downAt{};
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;   // never takes focus
+    case WM_WINDOWPOSCHANGING: {   // desktop only: stay under every window, like the widgets
+        auto* p = (WINDOWPOS*)lp;
+        if (KeepAtBottom() && !(p->flags & SWP_NOZORDER)) p->hwndInsertAfter = HWND_BOTTOM;
+        break;
+    }
     case WM_LBUTTONDOWN:
         g_pressed = true; GetCursorPos(&g_downAt); SetCapture(h); Interactive();
         return 0;

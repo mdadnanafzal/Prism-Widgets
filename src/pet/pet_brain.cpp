@@ -27,7 +27,9 @@ static Pose g_blendFrom, g_shown; static float g_blend = 1;   // short blend whe
 // frame loop
 static LONGLONG g_lastQpc = 0; static POINT g_lastCur{};
 static HANDLE g_timer = nullptr; static int g_timerFps = 0;
-static bool g_arrange = false, g_paused = false;
+static bool g_arrange = false, g_paused = false, g_peek = false;
+static bool g_ghost = false, g_overApp = false;   // Ctrl held over the pet / a maximized window behind it: see-through
+static float g_lastBusy = 0;                      // W.time of the last motion or interaction (calm frame rate after 20 s)
 static double g_renderMs = 0;
 static RECT g_hit{};
 static V2 g_lastDrawn{};   // pelvis in the last frame, to tell whether the pet is moving
@@ -61,6 +63,50 @@ static bool ButtonDown() {
 static bool Visible() { return g_wnd && g_set.enabled && !g_arrange && !g_paused; }
 static D2D1_COLOR_F GlowColour() { return g_set.glow == L"accent" ? Accent() : Hex(PaletteOf(g_set.theme).glow); }
 static bool ReducedMotion() { BOOL on = TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0); return !on; }
+
+static bool OnBattery() { SYSTEM_POWER_STATUS ps{}; return GetSystemPowerStatus(&ps) && ps.ACLineStatus == 0; }
+// A call is going on: some app is using the camera or the microphone right now (Windows' privacy records:
+// LastUsedTimeStop is 0 while an app holds the device).
+static bool DeviceInUse(const wchar_t* cap) {
+    auto scan = [](HKEY root, const std::wstring& path, auto& self, int depth) -> bool {
+        HKEY k;
+        if (RegOpenKeyExW(root, path.c_str(), 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+        bool used = false;
+        wchar_t name[260];
+        for (DWORD i = 0; !used; i++) {
+            DWORD n = 260;
+            if (RegEnumKeyExW(k, i, name, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            std::wstring sub = path + L"\\" + name;
+            if (depth == 0 && !wcscmp(name, L"NonPackaged")) { used = self(root, sub, self, 1); continue; }
+            ULONGLONG start = 0, stop = 1; DWORD sz = sizeof(start);
+            if (RegGetValueW(root, sub.c_str(), L"LastUsedTimeStart", RRF_RT_REG_QWORD, nullptr, &start, &sz) == ERROR_SUCCESS) {
+                sz = sizeof(stop);
+                if (RegGetValueW(root, sub.c_str(), L"LastUsedTimeStop", RRF_RT_REG_QWORD, nullptr, &stop, &sz) == ERROR_SUCCESS && start && !stop) used = true;
+            }
+        }
+        RegCloseKey(k);
+        return used;
+    };
+    std::wstring base = std::wstring(L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\") + cap;
+    return scan(HKEY_CURRENT_USER, base, scan, 0);
+}
+static bool InCall() { return DeviceInUse(L"webcam") || DeviceInUse(L"microphone"); }
+// Desktop only: under every window, owned by the desktop (so Win+D keeps it), like the widgets. On top: topmost.
+static void ApplyLayer() {
+    if (!g_wnd) return;
+    bool top = g_set.onTop || g_peek;
+    SetWindowLongPtrW(g_wnd, GWLP_HWNDPARENT, (LONG_PTR)(g_set.onTop ? nullptr : FindWindowW(L"Progman", nullptr)));
+    SetWindowPos(g_wnd, top ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (!top) SetWindowPos(g_wnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+bool KeepAtBottom() { return g_wnd && !g_set.onTop && !g_peek; }
+// The pet's body can be seen at the cursor: it is on top, or nothing covers it right there.
+static bool SeenAt(POINT pt) {
+    if (g_set.onTop || g_peek) return true;
+    HWND h = WindowFromPoint(pt);
+    return h == g_wnd || h == GetShellWindow() || !h;
+}
+static void SetGhost(bool ghost, bool overApp);
 
 static std::wstring MonName(HMONITOR m) { MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi); GetMonitorInfoW(m, &mi); return mi.szDevice; }
 static HMONITOR MonByName(const std::wstring& name) {
@@ -190,7 +236,7 @@ void Present(Surface& s, HWND hwnd, RECT box, const std::function<void(ID2D1Rend
         if (hr == (HRESULT)D2DERR_RECREATE_TARGET) { s.Free(); return; }
         GdiFlush();
         POINT src{ 0, 0 }; SIZE full{ s.w, s.h };   // the window keeps the surface's size too
-        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, s.alpha, AC_SRC_ALPHA };
         UpdateLayeredWindow(hwnd, nullptr, &s.org, &full, s.mem, &src, 0, &bf, ULW_ALPHA);
     }
 }
@@ -206,7 +252,8 @@ static void Render() {
         p.aF1 += .03f * std::sin(t * 2.1f); p.aB1 -= .03f * std::sin(t * 2.1f);
     }
     g_shown = p;
-    bool blink = p.eyes == Eyes::Open && std::fmod(W.time + W.seed, 3.6f) < .13f;
+    float blinkLen = std::max(.13f, g_timerFps > 0 ? 1.2f / g_timerFps : .13f);   // calm frame rates still catch every blink
+    bool blink = p.eyes == Eyes::Open && std::fmod(W.time + W.seed, 3.6f) < blinkLen;
     Expr e = VisorExpr(p.eyes, p.mouth, blink);
 
     // Window box: the body's joints plus room for the helmet, glow and props; the bed; floating text and dust.
@@ -247,6 +294,10 @@ static int TargetFps() {
     int f = W.fps;
     if (g_dragging || W.hanging || FxActive()) f = std::max(f, 30);
     if (C.reduced && !g_dragging && !W.hanging) f = std::min(f, 2);   // still poses
+    // Calm: resting loops (idle breathing, typing, scrolling, sleeping) drop to a few frames a second once nothing
+    // has happened for 20 s. Any motion, a drag or the cursor coming near brings full speed back at once.
+    if (W.fps > 15 || g_dragging || W.hanging || FxActive()) g_lastBusy = W.time;
+    if (W.time - g_lastBusy > 20) f = std::min(f, W.idle ? 5 : 8);
     return std::clamp(f, 0, 30);   // budget rule: movement at 30 fps, never 60
 }
 void SetFrameRate(int fps) {
@@ -305,7 +356,7 @@ static bool GrabPossible() {
 }
 static void StartMischief() {
     g_activeSec = 0; g_mischiefDue = false;
-    bool grab = (g_round++ % 2 == 1) && GrabPossible();   // every 2nd round: the cursor grab
+    bool grab = g_set.cursorGrab && (g_round++ % 2 == 1) && GrabPossible() && g_set.onTop && !g_overApp;   // every 2nd round, if allowed
     if (!grab) { Start(SceneFlowerPot(), Kind::Mischief); return; }
     g_grabHold = 0; g_grabActive = false;
     Start(SceneGrab([] { return GrabHold(); }), Kind::Grab, [] { g_grabActive = false; HookRefresh(); Next(); });
@@ -365,6 +416,14 @@ static void Frame() {
         Tick(h);
     }
     g_lastCur = cp;
+    {   // cursor near the pet: full frame rate; Ctrl held over it: see-through and click-through
+        float dx = std::max({ (float)g_hit.left - cp.x, 0.f, (float)cp.x - g_hit.right }), dy = std::max({ (float)g_hit.top - cp.y, 0.f, (float)cp.y - g_hit.bottom });
+        bool nearPet = std::hypot(dx, dy) < 120, onPet = dx == 0 && dy == 0;
+        if (nearPet && SeenAt(cp)) g_lastBusy = W.time;
+        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool ghost = g_ghost ? ctrl && nearPet : ctrl && onPet && !g_dragging && !W.hanging;
+        if (ghost != g_ghost) SetGhost(ghost, g_overApp);
+    }
     g_blend = std::min(1.f, g_blend + dt / .15f);
     Render();
     if (FxActive()) FxPresent();
@@ -410,6 +469,7 @@ static void EndBrowser() { g_browserOn = false; g_leaveWeb = false; if (g_wnd) K
 static void Proximity() {
     if (!g_set.collision || !Visible() || g_dragging || W.hanging) return;
     POINT c; GetCursorPos(&c);
+    if (g_ghost || g_overApp || !SeenAt(c)) { HookSet(HookMode::Off); return; }   // not while see-through or behind a window
     float dx = std::max({ (float)g_hit.left - c.x, 0.f, (float)c.x - g_hit.right }), dy = std::max({ (float)g_hit.top - c.y, 0.f, (float)c.y - g_hit.bottom });
     float d = std::hypot(dx, dy);
     if (d < 150) HookSet(HookMode::Collide);
@@ -424,12 +484,39 @@ static void HookRefresh() {
 
 // Once a second: pause/fullscreen check and the mischief clock (active time only).
 static void Tick1s() {
-    bool p = Paused();
+    bool p = Paused() || (g_set.batteryPause && OnBattery());
     if (p != g_paused) { g_paused = p; UpdateVisibility(); }
+    // On top of a maximized app on the pet's screen: fade out of the way (see-through and click-through).
+    bool over = false;
+    if (g_set.onTop && g_set.fadeOverApps && Visible() && !g_dragging && !W.hanging && !g_peek) {
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0; if (fg) GetWindowThreadProcessId(fg, &pid);
+        if (fg && pid != GetCurrentProcessId() && IsZoomed(fg) && fg != GetShellWindow()) {
+            RECT r; GetWindowRect(fg, &r);
+            POINT mid{ (g_hit.left + g_hit.right) / 2, (g_hit.top + g_hit.bottom) / 2 };
+            over = PtInRect(&r, mid) != FALSE;
+        }
+    }
+    if (over != g_overApp) SetGhost(g_ghost, over);
     LASTINPUTINFO li{ sizeof(li), 0 }; GetLastInputInfo(&li);
-    bool active = GetTickCount() - li.dwTime < 60000;
+    DWORD idleMs = GetTickCount() - li.dwTime;
+    bool active = idleMs < 60000;
     if (!p && Visible() && active && g_set.mischiefMinutes > 0) g_activeSec += 1;
-    g_mischiefDue = g_set.mischiefMinutes > 0 && g_activeSec >= g_set.mischiefMinutes * 60.0 && !p && !SettingsOpen() && !ButtonDown() && !g_dragging;
+    bool due = g_set.mischiefMinutes > 0 && g_activeSec >= g_set.mischiefMinutes * 60.0 && !p && !SettingsOpen() && !ButtonDown() && !g_dragging;
+    // Gentle: never while you type (wait for a 2-second pause) or during a call (camera or microphone in use).
+    if (due && (idleMs < 2000 || InCall())) due = false;
+    g_mischiefDue = due;
+}
+static void SetGhost(bool ghost, bool overApp) {
+    g_ghost = ghost; g_overApp = overApp;
+    if (!g_wnd) return;
+    bool see = ghost || overApp;
+    LONG ex = GetWindowLongW(g_wnd, GWL_EXSTYLE);
+    LONG want = see ? ex | WS_EX_TRANSPARENT : ex & ~WS_EX_TRANSPARENT;
+    if (want != ex) SetWindowLongW(g_wnd, GWL_EXSTYLE, want);
+    g_surf.alpha = ghost ? 60 : overApp ? 115 : 255;
+    if (see) HookSet(HookMode::Off);
+    if (Visible()) Render();
 }
 
 static void UpdateVisibility() {
@@ -445,9 +532,10 @@ static void UpdateVisibility() {
 
 static void Enable(bool atLogin) {
     if (g_wnd) return;
-    g_wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, L"PrismPet", L"Prism Pet",
-                            WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, g_inst, nullptr);
+    g_wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (g_set.onTop ? WS_EX_TOPMOST : 0), L"PrismPet", L"Prism Pet",
+                            WS_POPUP, 0, 0, 0, 0, g_set.onTop ? nullptr : FindWindowW(L"Progman", nullptr), nullptr, g_inst, nullptr);
     if (!g_wnd) return;
+    g_ghost = g_overApp = false; g_surf.alpha = 255; g_lastBusy = W.time;
     PlaceAtHome();
     g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, FgProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     OnForeground(GetForegroundWindow());
@@ -460,6 +548,7 @@ static void Enable(bool atLogin) {
     W.pal = &PaletteOf(g_set.theme); W.glow = GlowColour();
     Render();
     UpdateVisibility();
+    ApplyLayer();
 }
 
 static void Disable() {
@@ -569,6 +658,10 @@ void PetLoadSettings(const JVal* j) {
     std::wstring wd = j->str(L"wayDown", L"climb");
     s.wayDown = wd == L"jump" ? 1 : wd == L"screen" ? 2 : wd == L"ledges" ? 3 : wd == L"portal" ? 4 : 0;
     s.portalHome = j->str(L"otherScreen", L"portal") != L"adopt";
+    s.onTop = j->str(L"layer", L"top") != L"desktop";
+    s.fadeOverApps = j->boolean(L"fadeOverApps", true);
+    s.batteryPause = j->boolean(L"batteryPause", false);
+    s.cursorGrab = j->boolean(L"cursorGrab", false);
     auto list = [&](const wchar_t* key, std::vector<std::wstring>& out) {
         const JVal* a = j->get(key);
         if (!a || !a->isArr()) return;
@@ -604,6 +697,10 @@ void PetSaveSettings(JVal& j) {
     const wchar_t* ways[] = { L"climb", L"jump", L"screen", L"ledges", L"portal" };
     j.set(L"wayDown") = JVal::MakeStr(ways[Clamp(g_set.wayDown, 0, 4)]);
     j.set(L"otherScreen") = JVal::MakeStr(g_set.portalHome ? L"portal" : L"adopt");
+    j.set(L"layer") = JVal::MakeStr(g_set.onTop ? L"top" : L"desktop");
+    j.set(L"fadeOverApps") = JVal::MakeBool(g_set.fadeOverApps);
+    j.set(L"batteryPause") = JVal::MakeBool(g_set.batteryPause);
+    j.set(L"cursorGrab") = JVal::MakeBool(g_set.cursorGrab);
     if (g_homeSet) { JVal& h = j.set(L"home"); h = JVal::MakeObj(); h.set(L"monitor") = JVal::MakeStr(g_homeMon); }
 }
 
@@ -632,6 +729,11 @@ void PetApplySettings() {
     else if (!g_set.enabled && g_wnd) Disable();
     else if (g_wnd) {
         if (lastSize != g_set.size) Relayout();
+        bool p = Paused() || (g_set.batteryPause && OnBattery());
+        if (p != g_paused) g_paused = p;
+        if (!g_set.fadeOverApps || !g_set.onTop) g_overApp = false;
+        SetGhost(g_ghost, g_overApp);
+        ApplyLayer();
         UpdateVisibility();
         if (Visible()) { W.pal = &PaletteOf(g_set.theme); W.glow = GlowColour(); Render(); }
     }
@@ -660,6 +762,18 @@ std::wstring PetHomeName() {
 void PetArrange(bool on) {
     g_arrange = on;
     UpdateVisibility();
+}
+void PetPeek(bool on) {
+    if (g_peek == on) return;
+    g_peek = on;
+    if (on && g_overApp) SetGhost(g_ghost, false);   // fully visible over the peek backdrop
+    ApplyLayer();
+}
+HWND PetHwnd() { return Visible() ? g_wnd : nullptr; }
+bool PetScreenRect(RECT& r) {
+    if (!Visible() || IsRectEmpty(&g_hit)) return false;
+    r = g_hit;
+    return true;
 }
 
 void PetOnSession(PetSession e) {

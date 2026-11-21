@@ -273,6 +273,12 @@ void Events::LoadSettings(const JVal* o) {
     mine = o->boolean(L"mine", true);
     region = o->str(L"region", L"");
     icsUrl = o->str(L"ics", L"");
+    remindMins = (int)o->num(L"remindMins", 10);
+    remindAllDay = o->boolean(L"remindAllDay", true);
+    remindSound = o->boolean(L"remindSound", true);
+    remindedDay = (int)o->num(L"remindedDay", 0);
+    reminded.clear();
+    if (const JVal* r = o->get(L"reminded")) if (r->isArr()) for (auto& k : r->a) reminded.push_back(k.s);
 }
 void Events::SaveSettings(JVal& o) const {
     o = JVal::MakeObj();
@@ -281,6 +287,12 @@ void Events::SaveSettings(JVal& o) const {
     o.set(L"mine") = JVal::MakeBool(mine);
     o.set(L"region") = JVal::MakeStr(region);
     o.set(L"ics") = JVal::MakeStr(icsUrl);
+    o.set(L"remindMins") = JVal::MakeNum(remindMins);
+    o.set(L"remindAllDay") = JVal::MakeBool(remindAllDay);
+    o.set(L"remindSound") = JVal::MakeBool(remindSound);
+    o.set(L"remindedDay") = JVal::MakeNum(remindedDay);
+    JVal& r = o.set(L"reminded"); r = JVal::MakeArr();
+    for (auto& k : reminded) r.a.push_back(JVal::MakeStr(k));
 }
 void Events::LoadMine() {
     my.clear();

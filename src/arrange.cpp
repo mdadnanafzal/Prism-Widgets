@@ -252,6 +252,7 @@ void Register() {
 
 void StartArrange() {
     if (g_arranging) { if (O.wnd) SetForegroundWindow(O.wnd); return; }
+    EndPeek();
     Register();
     Interactive();
     g_arranging = true;

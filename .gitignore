@@ -1,0 +1,5 @@
+# Private release signing key: never commit it
+.release/
+build/
+*.new
+PrismWidgets.old.exe

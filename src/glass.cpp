@@ -4,10 +4,11 @@
 #include "common.h"
 
 Wallpaper g_wall;
+int g_glassClarity = 1, g_glassEdge = 1;
 
 //                id          name             panel blur  rad  tr    tg    tb    ta    sat  bri   refr chroma rim  border shadow size noise
 const Theme g_themes[] = {
-    { L"liquid",  L"Liquid Glass",   true,  2.5f, 28, 1.f,  1.f,  1.f,  .05f, 1.4f, 1.04f, 18, .35f, .95f, .00f, .30f, 22, 0 },
+    { L"liquid",  L"Liquid Glass",   true,  2.5f, 28, 1.f,  1.f,  1.f,  .05f, 1.4f, 1.04f, 22, .25f, .95f, .00f, .30f, 22, 0, 4 },
     { L"frosted", L"Frosted Glass",  true,  16,   22, 1.f,  1.f,  1.f,  .18f, 1.2f, 1.03f, 0,  0,    .35f, .35f, .22f, 24, 0 },
     { L"acrylic", L"Acrylic",        true,  24,   12, .11f, .11f, .13f, .50f, 1.5f, 1.00f, 0,  0,    .12f, .10f, .35f, 22, .03f },
     { L"tinted",  L"Tinted Glass",   true,  10,   24, -1,   -1,   -1,   .30f, 1.3f, 1.00f, 10, .20f, .60f, .15f, .28f, 22, 0 },
@@ -215,6 +216,38 @@ static inline float SdRound(float px, float py, float cx, float cy, float hx, fl
     return ol + std::min(std::max(qx, qy), 0.f) - r;
 }
 
+// Same with continuous-curvature corners: the corner is a superellipse |x|^n + |y|^n = r^n (n = 4 looks like Apple's
+// "squircle"). The p-norm is not an exact distance, so it is divided by its gradient length to keep anti-aliasing crisp.
+static inline float SdShape(float px, float py, float cx, float cy, float hx, float hy, float r, float n, float* nx, float* ny) {
+    if (n <= 2.01f) return SdRound(px, py, cx, cy, hx, hy, r, nx, ny);
+    float dx = px - cx, dy = py - cy;
+    float qx = std::fabs(dx) - (hx - r), qy = std::fabs(dy) - (hy - r);
+    if (qx > 0 && qy > 0) {
+        float ax = qx / r, ay = qy / r;   // normalised so the powers stay well-behaved
+        float f, gx, gy;
+        if (n == 4.f) {   // the common case, without pow()
+            float ax2 = ax * ax, ay2 = ay * ay, s4 = ax2 * ax2 + ay2 * ay2;
+            f = std::sqrt(std::sqrt(s4));
+            float inv3 = f > 1e-6f ? 1.f / (f * f * f) : 0.f;
+            gx = ax2 * ax * inv3; gy = ay2 * ay * inv3;
+        } else {
+            float px4 = std::pow(ax, n), py4 = std::pow(ay, n);
+            f = std::pow(px4 + py4, 1.f / n);
+            float gs = std::pow(px4 + py4, (1.f - n) / n);
+            gx = std::pow(ax, n - 1) * gs; gy = std::pow(ay, n - 1) * gs;
+        }
+        float gl = std::sqrt(gx * gx + gy * gy);
+        if (gl < 1e-6f) gl = 1;
+        if (nx) { *nx = gx / gl * (dx < 0 ? -1.f : 1.f); *ny = gy / gl * (dy < 0 ? -1.f : 1.f); }
+        return (f - 1) * r / gl;
+    }
+    if (nx) {
+        if (qx > qy) { *nx = dx < 0 ? -1.f : 1.f; *ny = 0; }
+        else { *nx = 0; *ny = dy < 0 ? -1.f : 1.f; }
+    }
+    return std::max(qx, qy) - r;
+}
+
 // Box blur on a float plane (sliding window, cost independent of radius)
 static void BlurPlane(float* img, float* tmp, int w, int h, int r) {
     if (r <= 0) return;
@@ -249,6 +282,10 @@ void RenderBackground(const Theme& t, int sx, int sy, int w, int h, int margin, 
     float x0 = (float)margin, y0 = (float)margin, x1 = (float)(w - margin), y1 = (float)(h - margin);
     float cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, hx = (x1 - x0) / 2, hy = (y1 - y0) / 2;
     float rad = std::min(t.radius * scale, std::min(hx, hy));
+    // squircle corners start curving earlier (1.4x) so they read as soft as a circle of the theme radius
+    const float sq = t.squircle;
+    float srad = sq > 0 ? std::min(rad * 1.4f, std::min(hx, hy)) : rad;
+    const bool liquid = sq > 0;
 
     if (!t.panel) {
         // Fully transparent; alpha=1 inside the panel so the widget still receives clicks.
@@ -265,7 +302,9 @@ void RenderBackground(const Theme& t, int sx, int sy, int w, int h, int margin, 
         return;
     }
 
-    float sigma = t.blur * scale, refr = t.refraction * scale;
+    static const float kClarity[4] = { 0.8f, 2.5f, 6.f, 12.f }, kEdge[3] = { 14.f, 26.f, 40.f };
+    float sigma = (liquid ? kClarity[Clamp(g_glassClarity, 0, 3)] : t.blur) * scale;
+    float refr = (liquid ? kEdge[Clamp(g_glassEdge, 0, 2)] : t.refraction) * scale;
     // working resolution for the blurred wallpaper: coarser when the blur is strong or the proxy is coarse anyway
     float f = std::max(1.f, std::min(4.f, sigma / 2.5f));
     f = std::max(f, std::min(3.f, g_wall.PhysPerProxy(mon)));
@@ -297,17 +336,36 @@ void RenderBackground(const Theme& t, int sx, int sy, int w, int h, int margin, 
     const float ta = t.ta, sat = t.saturation, bri = t.brightness;
     const float trA = tr * ta, tgA = tg * ta, tbA = tb * ta, keep = 1 - ta;
     float shSize = std::max(1.f, t.shadowSize * scale), shOff = shSize * 0.3f;
-    float rimW = 1.3f * scale, glowW = 7.f * scale, bordW = 0.7f * scale, zone = std::max(1.f, std::min(rad * 1.15f, std::min(hx, hy)));
+    float rimW = 1.3f * scale, glowW = 7.f * scale, bordW = 0.7f * scale;
+    float zone = std::max(1.f, std::min(rad * (sq > 0 ? 1.5f : 1.15f), std::min(hx, hy) * (sq > 0 ? 0.9f : 1.f)));   // lens band width
     const float lx = -0.55f, ly = -0.835f; // light from top-left
 
     // lookup tables over edge distance e (quarter-pixel steps) and shadow distance
-    float B = std::max({ refr > 0 ? zone : 0.f, rad, 8 * rimW, 4.5f * glowW, 8 * bordW }) + 1.f;   // beyond B the edge terms are invisible
+    float B = std::max({ refr > 0 ? zone : 0.f, srad, 8 * rimW, 4.5f * glowW, 8 * bordW }) + 1.f;   // beyond B the edge terms are invisible
     int ne = (int)std::ceil(B * 4) + 2;
-    std::vector<float> eRim(ne), eGlow(ne), eBord(ne), eRefr(ne);
+    std::vector<float> eRim(ne), eGlow(ne), eBord(ne), eRefr(ne), eTilt(ne);
+    // Lens edge: the rim is a rounded (quarter-circle) bevel of width `zone`. A ray looking straight through it is
+    // bent by Snell's law (glass n = 1.5); its sideways shift is what we sample. It is strongest at the rim and
+    // fades smoothly to nothing where the glass turns flat, so the wallpaper visibly curves and squeezes at the edge.
+    const float nGlass = 1.5f;
+    auto bend = [&](float tt, float* tilt) {
+        tt = Clamp(tt, 1e-4f, 1.f);
+        float s = (1 - tt) / std::sqrt(std::max(1e-8f, 1 - (1 - tt) * (1 - tt)));   // surface slope of the bevel
+        float th = std::atan(s), thT = std::asin(std::sin(th) / nGlass);
+        if (tilt) *tilt = std::sin(th);
+        return std::tan(th - thT);
+    };
+    const float bendMax = bend(1e-4f, nullptr);
     for (int i = 0; i < ne; i++) {
         float e = i * 0.25f;
         eRim[i] = std::exp(-e / rimW); eGlow[i] = std::exp(-e / glowW); eBord[i] = t.border * std::exp(-e / bordW);
-        float k = Clamp(1 - e / zone, 0.f, 1.f); eRefr[i] = refr * k * k;
+        if (liquid) {
+            float tilt = 0;
+            float tt = e / zone, k = Clamp(1 - tt, 0.f, 1.f);
+            // a broad lens fall-off, sharpened by the Snell bend right at the rim
+            eRefr[i] = e < zone ? refr * (0.6f * k * k + 0.4f * bend(tt, &tilt) / bendMax) : 0.f;
+            eTilt[i] = e < zone ? tilt : 0.f;
+        } else { float k = Clamp(1 - e / zone, 0.f, 1.f); eRefr[i] = refr * k * k; eTilt[i] = 0; }
     }
     const int ns = 256;
     float shLut[ns + 1];
@@ -340,16 +398,17 @@ void RenderBackground(const Theme& t, int sx, int sy, int w, int h, int margin, 
                 if (((x | y) & 3) == 0) { uint32_t p = out[(size_t)y * w + x]; lsum += (.2126f * ((p >> 16) & 255) + .7152f * ((p >> 8) & 255) + .0722f * (p & 255)) / 255.f; ln++; }
                 continue;
             }
-            float ds = SdRound(px, py - shOff, cx, cy, hx, hy, rad, nullptr, nullptr);
+            float ds = SdShape(px, py - shOff, cx, cy, hx, hy, srad, sq, nullptr, nullptr);
             float sa = shadowAt(ds);
             float nx = 0, ny = 0;
-            float d = SdRound(px, py, cx, cy, hx, hy, rad, &nx, &ny);
+            float d = SdShape(px, py, cx, cy, hx, hy, srad, sq, &nx, &ny);
             float cov = Clamp(0.5f - d, 0.f, 1.f);
             if (cov <= 0) { out[(size_t)y * w + x] = ((uint32_t)(sa * 255 + .5f)) << 24; continue; }
             float e = std::max(-d, 0.f);
             int ei = std::min((int)(e * 4), ne - 1);
             float r, g, b;
             float k = refr > 0 ? eRefr[ei] : 0;
+            if (liquid && k > 0) k *= 1 + 0.35f * 2 * std::fabs(nx * ny);   // corners curve two ways: they bend a little more
             if (k > 0.01f) {
                 float c = t.chroma;
                 r = fetch(PR, px + nx * k * (1 + c), py + ny * k * (1 + c));
@@ -368,7 +427,13 @@ void RenderBackground(const Theme& t, int sx, int sy, int w, int h, int margin, 
                 float spec = t.rim * eRim[ei] * (0.16f + 0.8f * std::max(dl, 0.f) + 0.38f * std::max(-dl, 0.f));
                 float glow = t.rim * 0.10f * eGlow[ei] * std::max(dl, 0.f);
                 float sheen = t.rim * 0.045f * (1 - Clamp((py - y0) / (y1 - y0), 0.f, 1.f));
-                float add = spec + glow + sheen; r += add; g += add; b += add;
+                float add = spec + glow + sheen;
+                if (liquid) {   // the bevel catches light top-left and falls into soft shade bottom-right; steep glass reflects more
+                    float tilt = eTilt[ei];
+                    add += t.rim * tilt * (0.075f * dl + 0.035f);
+                    add += t.rim * 0.22f * eRim[ei] * std::max(-dl, 0.f);   // second, softer highlight on the far edge
+                }
+                r += add; g += add; b += add;
             }
             if (t.border > 0) { float bd = eBord[ei]; r += (1 - r) * bd; g += (1 - g) * bd; b += (1 - b) * bd; }
             r = Clamp(r, 0.f, 1.f); g = Clamp(g, 0.f, 1.f); b = Clamp(b, 0.f, 1.f);

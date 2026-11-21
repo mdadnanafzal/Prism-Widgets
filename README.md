@@ -73,6 +73,11 @@ On the widget's page in Settings (Widgets → click a widget) there's also a **S
 | Media Controls | Compact: small art and buttons | Art on the left | **Album card** when tall (big art on top), longer titles when wide |
 | System Monitor | List with bars when narrow or tall | Rings in a row | Bigger rings |
 | Weather | Temperature and icon | Current conditions and details | Hourly strip (beside or below), then the 7-day list |
+| Focus Timer | Smaller ring | Ring with the time and three buttons | Bigger ring |
+| Sticky Note | Fewer lines (scroll with the mouse wheel) | About 8 lines | More lines; wider lines |
+| World Clocks | One city | One row per city (grows when you add a city) | Up to 8 cities |
+| Network Speed | Download and upload stacked | Side by side, with the last minute as a graph | Bigger graph |
+| Photo Frame | Any size; the photo is cropped to fill it (or shown whole with **Fit**) | | |
 | Custom widgets | Scale only, since their layout is fixed in the JSON file | | |
 
 To drag widgets at any time without Arrange mode, turn on Settings → General → **Move widgets without Arrange mode**.
@@ -129,6 +134,62 @@ The Calendar widget can show **public holidays**, **your own events** and a **sy
   * Outlook.com: Settings → Calendar → Shared calendars → **Publish a calendar** → ICS link.
   * Updated every 30 minutes. Recurring events, exceptions and cancelled events are handled. To disconnect, clear the address.
 * **Light on resources:** nothing is downloaded until a calendar with events is shown. Updates are one HTTPS request on a short-lived thread, and only the events from 2 months back to 13 months ahead are kept in memory.
+* **Reminders:** a small glass card appears in the bottom-right corner before each timed event (your own and the synced calendar), 10 minutes ahead by default. Birthdays and other all-day events of yours get a reminder at 9:00 on the day. Click the card to open that day, or × to close it; it hides by itself after 15 seconds.
+  * Settings → Calendar: **Remind me before events** (Off, 5, 10, 15 or 30 min), **Birthdays and all-day events**, **Reminder sound**, and **Preview a reminder**.
+  * Holidays never trigger reminders. Reminders wait while a fullscreen game runs or the screen is locked, and missed ones aren't shown later.
+
+## More widgets (v1.9)
+
+Five widgets that are **off by default**. Turn them on in **Settings → Widgets**.
+
+| Widget | What it does |
+|---|---|
+| **Focus Timer** | Pomodoro-style sessions: click **play** (or the ring) to start a focus session, then take a break. Choose 15–60 minute sessions and 5–15 minute breaks; every fourth break is a long one. When a session or break ends, a small glass card appears in the corner (with an optional chime). The dots show today's sessions. It keeps counting through restarts and sleep. |
+| **Sticky Note** | Click the note to write. **Enter** starts a new line; **Ctrl + Enter**, **Esc** or clicking away saves. Pick a paper colour (yellow, pink, mint, blue, lilac) or plain glass, and a text size. Right-click → **Copy text**. |
+| **World Clocks** | The time in up to 8 cities, with today/tomorrow and how far ahead or behind you they are, and a sun or moon for day or night. Right-click → **Add a city** (about 50 cities by region); right-click a city to rename, move or remove it. Daylight saving is handled by Windows. |
+| **Network Speed** | Live download and upload speed with a one-minute graph. Choose MB/s or Mbps and how often it updates. Only real network adapters are counted, so nothing is counted twice. |
+| **Photo Frame** | Show one photo, or a **slideshow** from a folder that changes every minute, 10 minutes, hour or day (or on click), in order or shuffled. Phone photos are turned the right way up. The photo is decoded at the widget's size and then released, so it costs very little memory. |
+
+## Desktop pet
+
+A small robot that lives on your taskbar edge. It types on a laptop while you use a coding tool, scrolls a phone while you browse, paces when bored, sleeps when you lock the PC and gets up to the odd prank. Click it to tickle it, drag it anywhere and it walks home. **Settings → Desktop pet** has its look, behaviour and the apps it reacts to.
+
+* **Light on resources:** 30 fps while it moves; once it has been resting for 20 seconds it drops to 5–8 fps, and to 0 when hidden. It pauses in fullscreen apps and on the lock screen, and optionally on battery (**Pause on battery**).
+* **Where it lives:** *On top of windows*, or *Desktop only* (under your windows, with the widgets; Peek lifts it too).
+* **Never in the way:** on top of a maximized app it fades and lets clicks through (**Fade over maximized apps**), and holding **Ctrl** over it makes it see-through anytime. Reminder and Focus Timer cards appear above its head.
+* **Gentle pranks:** never while you type or during a call (camera or microphone in use). The cursor grab is off unless you turn on **Cursor grab**.
+* Layout profiles remember whether the pet is shown.
+
+## Peek at your widgets
+
+Widgets live on the desktop, under your windows. Press **Win + Alt + W** to lift them above everything over a blurred, dimmed backdrop, use them, then press the shortcut again, **Esc**, or click anywhere to put them back.
+
+* Change the shortcut (Win + Alt + W, Ctrl + Alt + W, Ctrl + Shift + Space or Off) in **Settings → General → Peek**. If another app already owns a shortcut, Settings says so.
+* Also in the tray menu: **Peek at widgets**.
+
+## Layout profiles
+
+Save the whole setup (which widgets show, where they sit on each screen, their size and theme) as a named layout, such as *Work*, *Gaming* or *Minimal*, and switch between them in one click.
+
+* **Settings → General → Layout profiles:** **Save as new…**, then **Apply**, **Update** (save the current setup over it) or **Delete**.
+* **Tray menu → Layouts:** switch layouts without opening Settings.
+* Widget options (clock style, weather city, and so on) aren't part of a layout; they stay as they are.
+
+## Updates
+
+Prism Widgets checks for a new version about once a day (Settings → General → Updates → **Check for updates automatically**). When one is out, a notification appears; **Update now** downloads it, checks it, swaps the exe and restarts in about two seconds. Widgets, layouts, to-dos and events are kept.
+
+* Every update is described by `update.json` in this repository and signed with the maintainer's private key. The app only installs a file whose size and SHA-256 match that signed description, so a tampered or corrupted download is refused.
+* The folder holding `PrismWidgets.exe` must be writable (anywhere in your user folder is fine). If it isn't, the app says so and you can download the new version from the website.
+
+### Releasing a new version (maintainers)
+
+1. Bump `APP_VERSION` in `src/common.h` (and the version in `res/app.rc` and `res/app.manifest`), then build `PrismWidgets.exe`.
+2. Copy the new exe to the repository root.
+3. Run `pip install cryptography` once, then `python tools/release.py --version 1.9.1 --notes "What changed"`. This writes `update.json`.
+4. Commit and push `PrismWidgets.exe` and `update.json` together. Running copies pick the update up within a day.
+
+The private key lives in `.release/update-signing-key.pem`, which `.gitignore` keeps out of git. Back it up somewhere safe: without it no further update can be signed, and users would have to download new versions by hand.
 
 ## Media Controls widget
 
@@ -144,12 +205,14 @@ The Media Controls widget shows **what's playing right now**: the album art, tit
 
 | Theme | Look |
 |---|---|
-| **Liquid Glass** (default) | Clear glass with lens refraction at the edges, light chromatic fringing and specular rim highlights |
+| **Liquid Glass** (default) | Clear glass with continuous-curvature ("squircle") corners and a real lens edge: the rounded rim bends the wallpaper the way thick glass does (Snell's law), strongest at the rim and in the corners, with light colour fringing, a bright top-left rim, a soft opposite reflection and gentle bevel shading |
 | **Frosted Glass** | Classic glassmorphism: strong blur, white tint and a fine border |
 | **Acrylic** | Windows-style dark acrylic with blur, tint and grain |
 | **Tinted Glass** | Glass tinted with your accent colour |
 | **Clear** | No panel. Text sits directly on the wallpaper with a soft shadow |
 | **Solid Dark / Solid Light** | Nearly opaque panels |
+
+**Settings → Appearance → Liquid Glass** fine-tunes that theme: **Clarity** (Clear, Default, Soft, Frosted) and **Edge refraction** (Subtle, Normal, Strong).
 
 The glass is rendered from your actual wallpaper, so the widgets blend into it. Prism Widgets reloads automatically when the wallpaper changes, including slideshow and Spotlight changes. With **Text colour → Automatic**, each widget picks light or dark text based on the wallpaper behind it.
 
@@ -225,7 +288,7 @@ Custom widgets are JSON files in `%APPDATA%\PrismWidgets\widgets\`. To open that
 
 ## Where data is stored
 
-`%APPDATA%\PrismWidgets\` contains `config.json` (widgets, positions and themes), `todo.json`, `events.json` (your calendar events), cached holiday and calendar files (`holidays_XX.ics`, `calendar_sync.ics`) and `widgets\`. To reset everything, delete this folder while the app is closed.
+`%APPDATA%\PrismWidgets\` contains `config.json` (widgets, positions and themes), `todo.json`, `events.json` (your calendar events), cached holiday and calendar files (`holidays_XX.ics`, `calendar_sync.ics`) and `widgets\`. Layout profiles, the peek shortcut and update settings are in `config.json` too. To reset everything, delete this folder while the app is closed.
 
 ## Build from source
 
@@ -251,6 +314,11 @@ Source layout:
 | `src/events.cpp` | Calendar events: holiday and iCal download, the .ics parser with recurrence rules, your own events |
 | `src/daypop.cpp` | The day details popover (add, edit, delete events) |
 | `src/net.cpp` | Small asynchronous HTTPS GET helper (WinHTTP) |
+| `src/update.cpp` | One-click updates: signed manifest check (ECDSA P-256), download, SHA-256 check, exe swap |
+| `src/peek.cpp` | The peek shortcut and its blurred backdrop |
+| `src/reminders.cpp` | Event reminders and the corner notification card (also used by the Focus Timer) |
+| `src/widgets2.cpp` | Focus Timer, Sticky Note, World Clocks, Network Speed and Photo Frame |
+| `tools/release.py` | Signs `update.json` for a release |
 | `src/media.cpp` | The Windows media session ("now playing"), accessed through the WinRT interfaces directly |
 | `src/util.cpp`, `src/json.cpp` | Helpers, variables and the JSON parser |
 

@@ -100,3 +100,25 @@ void OpenPetSettings();
 
 // Paused while the screen is locked or off, or a fullscreen app runs (app.cpp)
 bool Paused();
+
+// Peek (peek.cpp): a global shortcut lifts the widgets above all windows over a blurred backdrop
+extern std::wstring g_peekKey;   // "win+alt+w", "ctrl+alt+w", "ctrl+shift+space", "off"
+extern bool g_peekKeyOk, g_peeking;
+bool RegisterPeekKey();
+bool IsPeekHotkey(WPARAM id);
+void StartPeek();
+void EndPeek();
+void TogglePeek();
+std::wstring PeekKeyLabel();
+
+// Layout profiles (app.cpp): named snapshots of which widgets show, where, how big, in which theme
+extern std::wstring g_layout;    // the one applied last
+std::vector<std::wstring> LayoutNames();
+int  LayoutWidgetCount(const std::wstring& name);
+void SaveLayout(const std::wstring& name);
+void ApplyLayout(const std::wstring& name);
+void DeleteLayout(const std::wstring& name);
+
+// Settings shortcuts
+void OpenUpdateSettings();
+void OpenLayoutSettings();

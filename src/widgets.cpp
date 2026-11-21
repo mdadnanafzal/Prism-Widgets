@@ -458,6 +458,16 @@ public:
                           { g_events.icsUrl.empty() ? L"Connect\u2026" : L"Change\u2026" }, nullptr, [](int) { g_events.AskIcsUrl(); } });
             o.push_back({ Opt::Action, L"Update holidays & calendar now", L"Holidays refresh weekly, the synced calendar every 30 minutes",
                           { L"Refresh" }, nullptr, [](int) { g_events.Refresh(true); } });
+            o.push_back({ Opt::Choice, L"Remind me before events", L"Timed events from your list and the synced calendar",
+                          { L"Off", L"5 min", L"10 min", L"15 min", L"30 min" },
+                          [] { int m = g_events.remindMins; return m == 5 ? 1 : m == 10 ? 2 : m == 15 ? 3 : m == 30 ? 4 : 0; },
+                          [](int i) { static const int v[] = { 0, 5, 10, 15, 30 }; g_events.remindMins = v[i]; RequestSave(); } });
+            o.push_back({ Opt::Toggle, L"Birthdays and all-day events", L"A reminder at 9:00 on the day, for events you added", {},
+                          [] { return g_events.remindAllDay ? 1 : 0; }, [](int v) { g_events.remindAllDay = v != 0; RequestSave(); } });
+            if (g_events.remindMins || g_events.remindAllDay) {
+                o.push_back({ Opt::Toggle, L"Reminder sound", L"", {}, [] { return g_events.remindSound ? 1 : 0; }, [](int v) { g_events.remindSound = v != 0; RequestSave(); } });
+                o.push_back({ Opt::Action, L"Preview a reminder", L"Shows one in the corner of your screen", { L"Show" }, nullptr, [](int) { ShowTestReminder(); } });
+            }
         }
         o.push_back({ Opt::Choice, L"Week starts on", L"Automatic follows your Windows region settings", { L"Automatic", L"Monday", L"Sunday" },
                       [this] { return firstDay < 0 ? 0 : firstDay == 0 ? 1 : 2; }, [this](int v) { firstDay = v == 0 ? -1 : v == 1 ? 0 : 6; } });
